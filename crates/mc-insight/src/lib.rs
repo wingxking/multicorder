@@ -312,7 +312,7 @@ mod tests {
 
     fn setup() -> (Store, String, Vec<TranscriptEvent>) {
         let store = Store::open_memory().unwrap();
-        let src = store.create_source(&NewSource { kind: "chromium_tab", title: "t", app_bundle_id: None, url: None, video_key: None }).unwrap();
+        let src = store.create_source(&NewSource { kind: "chromium_tab", title: "t", app_bundle_id: None, capture_source_id: None, url: None, video_key: None }).unwrap();
         let s = store.create_session(&src, "live", None, None).unwrap();
         let mut evs = Vec::new();
         for (i, text) in ["The Falcon budget is 42 million dollars.", "Launch is planned for March."].iter().enumerate() {

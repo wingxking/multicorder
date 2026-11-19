@@ -10,5 +10,7 @@ const common = { bundle: true, target: "chrome116", sourcemap: false, minify: fa
 await build({ ...common, entryPoints: ["src/background.ts"], outfile: "dist/background.js", format: "esm" });
 await build({ ...common, entryPoints: ["src/offscreen.ts"], outfile: "dist/offscreen.js", format: "esm" });
 await build({ ...common, entryPoints: ["src/media-clock.ts"], outfile: "dist/media-clock.js", format: "iife" });
-await build({ ...common, entryPoints: ["src/sidepanel.tsx"], outfile: "dist/sidepanel.js", format: "esm", jsx: "automatic" });
+for (const page of ["sidepanel", "options", "library"]) {
+  await build({ ...common, entryPoints: [`src/${page}.tsx`], outfile: `dist/${page}.js`, format: "esm", jsx: "automatic" });
+}
 console.log("extension built in dist/");

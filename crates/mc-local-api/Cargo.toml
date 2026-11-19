@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 mc-core.workspace = true
 mc-engine.workspace = true
+mc-audio.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 futures.workspace = true
@@ -21,3 +22,5 @@ hex.workspace = true
 [dev-dependencies]
 reqwest.workspace = true
 mc-asr.workspace = true
+mc-insight.workspace = true
+async-trait.workspace = true

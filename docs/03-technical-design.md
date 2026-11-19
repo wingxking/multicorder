@@ -17,6 +17,7 @@
 **目标**
 
 - 一个 Mac App 和一个 Chromium 插件，组成一个产品：同时采集**多个浏览器 Tab、多个原生 App 和麦克风**，每一路独立地录音、转写、总结，每条要点都有证据。
+- **插件可以独立运行**：没有 App 时，自己完成录音、转写、总结和检索；有 App 时，可以连接 App，由 App 统一处理（第 5.11 节）。
 - 录音不依赖转写和总结。总结可以实时做、结束后做，或者不做。
 - 自愿把公开视频的转写文字共享给 Catchup（[plan.md](plan.md) 第 6 节）。
 
@@ -326,6 +327,19 @@ let started = ca::device_start(agg, Some(proc_id))?;
 - 开源的按 App 混音器（Fader、FineTune）在生产中给每个正在出声的 App 各建一个 tap，同时运行几十个。这说明多个 tap 并存可行；V-1 主要验证“只录不放（`Unmuted`）”时的 CPU 占用和稳定性。
 
 **省电（P1）：** 参考 Fader 的 `ProcessTap+Idle`。一个 App 连续 60 秒不出声时，暂停这个 tap 的 IO，由 AppWatcher 的 2 秒轮询在它重新出声时恢复。暂停期间按静音记录，并在时间轴上标为“无声”。
+
+### 4.4.1 防重复录制（2026-11-19 新增）
+
+**问题：** Chrome 所有 Tab 的声音都由同一个音频进程播放。插件录某个 Tab 时，Tab 本身被静音，插件在 offscreen 页面里把声音接回扬声器，这份回放仍然从 Chrome 的音频进程发出。所以如果用户同时在 App 里录“Google Chrome”这个 App，同一段声音会被录两次。按进程的 tap 无法排除 Chrome 里的某几个 Tab。
+
+**规则：**
+
+1. **浏览器身份：** 原生消息宿主由浏览器启动，它的父进程就是浏览器。宿主用 `mc-capture-macos::grouping::identify` 得到浏览器的 bundle ID，放进配对回复的 `browser_bundle_id` 字段。插件建立 Tab 会话时带上这个值（`source.browser`），引擎把它存进 `sources.app_bundle_id`。
+2. **App 端阻止：** 用户要录某个 App 时，如果这个 App 的 `app_id` 等于某个进行中的 Tab 会话的 `browser`，引擎拒绝，错误码为 `duplicate_browser_tabs`，HTTP 状态 409。用户确认后带上 `force: true` 可以强制录制。`/v1/apps` 和 App 列表里，这个浏览器标为 `tab_recording: true`，界面上显示“插件正在按 Tab 录制”。
+3. **插件端提示：** 建立 Tab 会话时，如果这个浏览器已经在被 App 整体录制，引擎仍然创建会话（按 Tab 采集本身不会重复），但在回复里附上警告 `browser_recorded_by_app`，以及那个 App 会话的 ID。侧边栏显示提示，并提供“停止 App 对浏览器的录制”按钮。
+4. **静默采集：** 插件设置里可以选“静默录制”，不把 Tab 的声音接回扬声器，App 端就录不到这一份。
+5. **以后的自动录制规则**（P1）同样跳过正在被插件按 Tab 录制的浏览器。
+6. **没有配对时的兜底**（P1，未实现）：同一时间录制的各路音频做短时能量包络的互相关，相关系数超过 0.9 并持续 30 秒，就标为“疑似重复”。
 
 ### 4.5 MicSource
 
@@ -696,6 +710,92 @@ idle ─调用插件→ requesting ─拿到流ID且 getUserMedia 成功→ capt
 - **Edge、Brave：** 同一份代码；原生消息宿主的清单路径各不相同（第 4.11 节）。
 - **Arc：** 能否打开侧边栏要实测，不支持时改用弹窗。
 - **Firefox、Safari：** 不支持 `tabCapture`，不做。
+
+### 5.11 独立模式：插件不依赖 App（2026-11-19 新增）
+
+插件默认**独立运行**：没有安装或没有启动 Mac App 时，录音、转写、要点、报告、检索都在插件内完成。检测到 App 时，可以切到“连接模式”，把音频交给 App 处理（第 5.3–5.5 节）。
+
+**处理位置**（设置项 `appConnection`，2026-11-19 修订）：
+
+| 值 | 行为 |
+|---|---|
+| `standalone`（默认） | 录音、转写、要点、报告都在插件里完成，数据存在浏览器里。转写和总结调用哪个服务见第 5.12 节 |
+| `app` | 把音频交给 Mac App 处理和保存（连接模式）；连不上就提示安装或启动 App |
+
+旧版本的 `auto` 读取时按 `standalone` 处理。
+
+每个会话记录自己的 `backend`（`local` 或 `app`），开始后不再切换。
+
+**独立模式的架构**（全部在 offscreen 文档里，service worker 被回收也不影响）：
+
+```
+tabCapture 流 ──┬─▶ 回放（可静默）
+               ├─▶ MediaRecorder（audio/webm;codecs=opus，32 kbps）→ OPFS 文件 rec/<会话>.webm（每 2 秒追加一块）
+               └─▶ pcm-tap Worklet（16 kHz）─▶ Chunker（与 mc-vad 相同的块策略）
+                                              └─▶ 转写队列（实时优先、按会话轮转、并发 3）─▶ 云端转写
+                                                   └─▶ IndexedDB transcripts ─▶ 要点归并（与 mc-insight 相同的提示词和校验）─▶ IndexedDB insights
+停止 ─▶ 等待队列清空 ─▶（结束后模式：解码录音文件 → 16 kHz → 切块 → 转写）─▶ 报告 ─▶ IndexedDB reports
+```
+
+| 部分 | 实现 |
+|---|---|
+| 录音 | `MediaRecorder` 直接录原始流，每 2 秒的数据块追加到 OPFS 的同一个文件（webm 数据块按顺序拼接后就是完整文件）。单路约 14 MB/小时。插件申请了 `unlimitedStorage` |
+| 切块与校验 | 移植自 Rust 的 `mc-vad`（块策略常量相同）、`mc-insight` 的数字校验和要点操作校验，放在 `apps/extension/src/local/`，并配有单元测试。以后可以把 Rust crate 编译成 WebAssembly 来共用，彻底消除两份实现 |
+| 转写 | 云端：MOSS 协议或 OpenAI 兼容协议（OpenAI、Groq 等），与 `mc-asr` 相同的请求格式；429 和 5xx 退避重试。浏览器内模型（WebGPU 上的 Whisper）留到下一步 |
+| 要点和报告 | OpenAI 兼容的 Chat Completions，主供应商加备用供应商；提示词和校验与桌面端相同 |
+| 存储 | IndexedDB 库 `multicorder`，表为 `sessions`、`transcripts`（按会话建索引）、`insights`、`reports`。所有查询都带会话 ID（隔离不变量）。检索在个人数据量下按会话逐条扫描 |
+| 结束后模式和补转 | 用 `AudioContext.decodeAudioData` 解码录音文件，再用 `OfflineAudioContext` 转成 16 kHz，然后切块转写 |
+| 界面 | 侧边栏同时显示本地会话和 App 会话；新增 `library.html`（资料库：会话列表、转写、要点、报告、导出 Markdown/SRT/JSON、下载录音）和 `options.html`（转写和模型的供应商、密钥、输出语言、连接方式、静默录制） |
+| 密钥 | 存在 `chrome.storage.local`，只在 offscreen 里读取，不写进日志。安全性不如钥匙串，设置页会明确说明 |
+| 网络权限 | 本地 App 只用 `http://127.0.0.1/*`；常见供应商（MOSS、OpenAI、Groq、智谱、DeepSeek）的域名写进 `host_permissions`；自定义地址通过 `optional_host_permissions` 在设置页按需申请。插件不加载任何远程代码（Chrome 应用商店的规定） |
+
+**与 App 的关系：** 连接模式下 App 是唯一的数据中心。把独立模式的历史会话导入 App（`POST /v1/import`）放到下一步（P1）。
+
+### 5.12 转写与总结服务的切换：本机、云端、自有密钥（2026-11-19 新增）
+
+独立模式下，插件把切好的音频块和总结请求发给一个“服务”。设置项 `service`：
+
+| 值 | 地址 | 鉴权 | 说明 |
+|---|---|---|---|
+| `local`（默认） | 本机 Mac 上的 Multicorder（App 或 `mcd`），`http://127.0.0.1:<端口>` | 通过原生消息宿主配对拿到的令牌 | 上线前的默认选择。密钥只在 Mac 端（钥匙串或 `config.json`），插件不存密钥 |
+| `cloud` | `https://multicoder.followkol.live`（可改） | 设置页填写的访问令牌 | 云端服务上线后切换。接口与本机服务相同 |
+| `custom` | 用户自己的 MOSS 或 OpenAI 兼容地址 | 存在浏览器里的密钥 | 第 5.11 节原有方式 |
+
+**服务接口**（本机服务和云端服务实现同一套，令牌放在 `Authorization: Bearer`）：
+
+| 接口 | 请求 | 回复 |
+|---|---|---|
+| `POST /v1/asr/transcribe?lang=` | 一段 WAV（不超过 30 秒、2 MB；其他采样率和声道会被转成 16 kHz 单声道） | `{engine, segments:[{start_ms,end_ms,text}]}`；转写不可用时 503 `{code:"asr_unavailable"}`；不是 WAV 时 400；过大时 413 |
+| `POST /v1/llm/chat` | `{system, user, max_tokens}`（`max_tokens` 最多 4000） | `{out, usage:{provider, model, tokens}}`；没有模型时 503 `{code:"llm_unavailable"}` |
+| `GET /v1/health` | — | 200 表示服务可达 |
+
+两个接口只处理请求、记录用量，不建会话、不保存音频和文字：插件的录音和转写只存在浏览器里。
+
+**选择目标的位置：** service worker 根据设置解析出目标（本机服务需要先配对），offscreen 里的引擎通过 `resolve-service` 消息取得，缓存 20 秒，出错时立即作废重新解析（本机服务重启后端口和令牌会变）。侧边栏顶部显示当前服务和它是否可达，每 15 秒检查一次。
+
+### 5.13 转写服务不可用时：录音照常，事后补转（2026-11-19 新增）
+
+原则：**录音不依赖转写。** 转写服务失败（本机服务没开、云端没上线、密钥失效、限流）时，录音照常写入，界面明确提示，服务恢复后自动补上文字，也可以手动重试。
+
+| 环节 | 插件（独立模式） | Mac 引擎 |
+|---|---|---|
+| 记录失败 | 失败的块写入 IndexedDB 的 `pending` 表（会话、起止时间、轮次、尝试次数、最后的错误）；会话带 `asr: {state, failed_chunks}` | 失败的块写入 SQLite 的 `asr_failures` 表；会话列表和详情带 `asr` 对象。不再记成音频空档 |
+| 提示 | 卡片显示“转写不可用，录音已保存，N 段等待补转”和“重试”按钮；资料库显示“文字缺失”；侧边栏顶部显示服务不可用 | 同样的卡片和资料库提示；侧栏底部显示“转写降级” |
+| 自动补转 | 每 30 秒（启动后 3 秒先跑一次）扫描 `pending`，从 OPFS 录音解码对应区间重新转写；浏览器重启后由 service worker 恢复 | 每 30 秒从 `asr_failures` 读取，已归档的区间从 FLAC 读回，以补转优先级送进转写队列；对已停止的会话也有效 |
+| 手动重试 | `local-retry` 消息：先补 `pending`；如果会话已停止、没有文字也没有待补的块（例如全程失败或模式为“关”），就把整段录音重新切块转写 | `POST /v1/sessions/{id}/retry-asr` 和 Tauri 命令 `retry_asr`，规则相同 |
+| 补齐之后 | 发出 `asr_recovered`，重新归并要点、重新生成报告 | 相同（模式为“关”的会话只补文字） |
+| 导出录音 | 卡片和资料库的“保存录音”：先 `local-flush` 把 MediaRecorder 的数据落盘，再下载 OPFS 里的 `.webm` | `GET /v1/sessions/{id}/audio` 和 Tauri 命令 `export_audio`：整段录音合成一个 16 kHz WAV（桌面端存到“下载”文件夹） |
+
+### 5.14 界面风格（2026-11-19 新增）
+
+插件的侧边栏、资料库、设置页和桌面 App 共用 `packages/ui`：
+
+- `theme.ts`：一套 CSS 变量（背景、表面、边框、三级文字、强调色红、成功、警告、信息），浅色和深色两组；`data-theme` 为 `light` 或 `dark` 时强制使用，否则跟随系统。按钮、分段控件、状态标签、提示条等基础样式也在这里；
+- `ThemeToggle`：在“跟随系统 → 浅色 → 深色”之间切换，选择保存在本页的 localStorage，插件另外存到 `chrome.storage.local`，让各页面一致；
+- `icons.tsx`：16 像素线条图标，不用 emoji；
+- `SessionCard`：来源图标、标题、时长、状态标签（录制中、重连中、收尾中、失败、文字缺失、完成）、电平条、转写降级提示和重试、总结模式分段控件、打点、“我错过了什么”、保存录音、停止。
+
+桌面 App 改为左侧导航（实时、资料库、设置）；在普通浏览器里打开时用示例数据，方便截图检查。
 
 ## 6. 协议规范（`packages/protocol`，版本 1）
 

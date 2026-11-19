@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod config;
 
-/// Every audio frame inside the engine is 16 kHz mono f32.
+/// Speech processing and browser ingest use 16 kHz mono audio.
 pub const SAMPLE_RATE: u32 = 16_000;
 /// Samples per engine frame (20 ms).
 pub const FRAME_SAMPLES: usize = 320;
@@ -17,6 +17,35 @@ pub fn new_id() -> String {
 
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Mono PCM settings for local audio archives. Transcription still uses 16 kHz PCM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingFormat {
+    pub sample_rate: u32,
+    pub bits_per_sample: u16,
+}
+
+impl Default for RecordingFormat {
+    fn default() -> Self {
+        Self { sample_rate: SAMPLE_RATE, bits_per_sample: 16 }
+    }
+}
+
+impl RecordingFormat {
+    pub fn validate(self) -> anyhow::Result<()> {
+        anyhow::ensure!(matches!(self.sample_rate, 16_000 | 24_000 | 32_000 | 44_100 | 48_000), "Unsupported recording sample rate");
+        anyhow::ensure!(matches!(self.bits_per_sample, 16 | 24), "Unsupported recording bit depth");
+        Ok(())
+    }
+
+    pub fn samples_at(self, ms: i64) -> usize {
+        ((ms.max(0) as u64).saturating_mul(u64::from(self.sample_rate)) / 1000) as usize
+    }
+
+    pub fn duration_ms(self, samples: usize) -> i64 {
+        (samples as u64 * 1000 / u64::from(self.sample_rate)) as i64
+    }
 }
 
 pub fn ms_to_samples(ms: i64) -> usize {
@@ -57,8 +86,9 @@ impl SourceKind {
 #[serde(rename_all = "snake_case")]
 pub enum SummaryMode {
     Off,
-    Live,
+    /// ASR on by default: live transcription and rolling key points.
     #[default]
+    Live,
     After,
 }
 
@@ -126,6 +156,10 @@ pub enum SourceSpec {
         tab_id: Option<i64>,
         url: Option<String>,
         title: Option<String>,
+        /// Bundle id of the browser hosting the tab (reported by the native host), used to
+        /// prevent recording the same audio twice through a whole-browser app tap.
+        #[serde(default)]
+        browser: Option<String>,
     },
     MacApp {
         /// `AppAudioInfo::app_id` from the app list.
@@ -152,6 +186,7 @@ impl SourceSpec {
 pub enum EngineEvent {
     Status { session_id: String, status: String, detail: Option<String> },
     Level { session_id: String, rms_db: f32, silent: bool },
+    Waveform { session_id: String, peaks: Vec<f32>, audio_ms: i64 },
     Transcript { session_id: String, event: TranscriptEvent },
     Insight { session_id: String, insight: Insight },
     Gap { session_id: String, start_ms: i64, end_ms: i64, cause: String },
@@ -164,6 +199,7 @@ impl EngineEvent {
         match self {
             EngineEvent::Status { session_id, .. }
             | EngineEvent::Level { session_id, .. }
+            | EngineEvent::Waveform { session_id, .. }
             | EngineEvent::Transcript { session_id, .. }
             | EngineEvent::Insight { session_id, .. }
             | EngineEvent::Gap { session_id, .. }

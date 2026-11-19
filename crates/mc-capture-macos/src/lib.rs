@@ -11,9 +11,21 @@ pub mod grouping;
 mod tap;
 #[cfg(target_os = "macos")]
 mod capture;
+#[cfg(target_os = "macos")]
+mod mic;
 
 #[cfg(target_os = "macos")]
-pub use capture::{AppCapture, CaptureEvent, EventSink, Sink16k};
+pub use capture::{AppCapture, CaptureEvent, EventSink, AudioSink};
+#[cfg(target_os = "macos")]
+pub use mic::{list_microphones, microphone, MicCapture};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MicrophoneInfo {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+    pub channel: Option<u32>,
+}
 
 /// Prefix of every aggregate device we create: device lists filter it, startup cleanup uses it.
 pub const DEVICE_PREFIX: &str = "Multicorder-";

@@ -4,8 +4,8 @@ import { join } from "node:path";
 
 export const OUT = new URL("../../test-output/", import.meta.url).pathname;
 
-export function pairing() {
-  const api = JSON.parse(readFileSync(join(process.env.MC_DATA_DIR, "run/api.json"), "utf8"));
+export function pairing(dir = process.env.MC_DATA_DIR) {
+  const api = JSON.parse(readFileSync(join(dir, "run/api.json"), "utf8"));
   return { base: `http://127.0.0.1:${api.port}`, port: api.port, token: api.token };
 }
 
@@ -81,4 +81,33 @@ export async function verify(p, id, { expect, forbid, label }) {
     insights: insights.map((i) => `${i.state}: ${i.text}`),
     report_head: report?.body?.slice(0, 400) ?? null,
   };
+}
+
+/** Streams PCM16 into a tab session over the WebSocket ingest protocol (E2E_SPEED× real time). */
+export async function stream(p, sessionId, pcm, withMarks = false) {
+  const speed = Number(process.env.E2E_SPEED || 4);
+  const ws = new WebSocket(`ws://127.0.0.1:${p.port}/v1/ingest/${sessionId}`, ["mc.v1", p.token]);
+  ws.binaryType = "arraybuffer";
+  await new Promise((res, rej) => ((ws.onopen = res), (ws.onerror = rej)));
+  ws.send(JSON.stringify({ t: "hello", session_id: sessionId }));
+  let acked = -1;
+  ws.onmessage = (m) => {
+    const msg = JSON.parse(m.data);
+    if (msg.t === "ack") acked = msg.upto_seq;
+  };
+  const frames = Math.ceil(pcm.length / 1600);
+  const t0 = Date.now();
+  for (let seq = 0; seq < frames; seq++) {
+    const chunk = new Int16Array(1600);
+    chunk.set(pcm.subarray(seq * 1600, (seq + 1) * 1600));
+    const wall = t0 + (seq * 100) / speed;
+    ws.send(frame(seq, wall, chunk));
+    if (withMarks && seq % 10 === 0) ws.send(JSON.stringify({ t: "media_mark", wall_ms: wall, media_ms: 60_000 + seq * 100, paused: false, rate: 1, live: false, video_key: "youtube:e2etest" }));
+    if (seq % 10 === 9) await sleep(1000 / speed);
+  }
+  // Two seconds of silence closes the last speech chunk.
+  for (let i = 0; i < 20; i++) ws.send(frame(frames + i, Date.now(), new Int16Array(1600)));
+  await sleep(1500);
+  ws.close();
+  return { frames, acked };
 }

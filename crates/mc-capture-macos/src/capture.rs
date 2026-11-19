@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use cidre::core_audio as ca;
+use cidre::{core_audio as ca, ns, objc};
 use mc_audio::StreamResampler;
 
-use crate::grouping::{identify, is_ignored, process_name};
+use crate::grouping::{identify, is_ignored, outermost_app, process_name};
 use crate::tap::ProcessTap;
 use crate::AppAudioInfo;
 
@@ -20,6 +20,26 @@ pub fn list_apps() -> Result<Vec<AppAudioInfo>> {
     let me = std::process::id() as i32;
     let procs = ca::System::processes().map_err(|e| anyhow::anyhow!("process list: {e:?}"))?;
     let mut groups: BTreeMap<String, AppAudioInfo> = BTreeMap::new();
+    objc::ar_pool(|| {
+        for app in ns::Workspace::shared().running_apps().iter() {
+            let pid = app.pid();
+            if pid == me || pid <= 0 || app.is_terminated() {
+                continue;
+            }
+            let Some(path) = app.bundle_url().and_then(|url| url.path()).map(|p| p.to_string()) else { continue };
+            let bundle = std::path::Path::new(&path);
+            if bundle.starts_with("/System/Library") || outermost_app(bundle).as_deref() != Some(bundle) {
+                continue;
+            }
+            let bundle_id = app.bundle_id().map(|id| id.to_string());
+            let app_id = bundle_id.clone().unwrap_or_else(|| path.clone());
+            let name = app.localized_name().map(|name| name.to_string()).unwrap_or_else(|| app_id.clone());
+            groups.entry(app_id.clone()).or_insert_with(|| AppAudioInfo {
+                app_id, bundle_id, name, bundle_path: Some(path), pids: vec![pid], process_objs: vec![],
+                is_emitting: false, is_recording: false,
+            });
+        }
+    });
     for p in procs {
         let Ok(pid) = p.pid() else { continue };
         if pid == me || pid <= 0 {
@@ -57,6 +77,7 @@ pub fn list_apps() -> Result<Vec<AppAudioInfo>> {
     let mut apps: Vec<_> = groups.into_values().collect();
     for a in &mut apps {
         a.pids.sort_unstable();
+        a.pids.dedup();
         a.process_objs.sort_unstable();
     }
     apps.sort_by(|a, b| b.is_emitting.cmp(&a.is_emitting).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
@@ -74,7 +95,7 @@ pub enum CaptureEvent {
     Error(String),
 }
 
-pub type Sink16k = Arc<dyn Fn(&[f32]) + Send + Sync>;
+pub type AudioSink = Arc<dyn Fn(&[f32]) + Send + Sync>;
 pub type EventSink = Arc<dyn Fn(CaptureEvent) + Send + Sync>;
 
 struct TapSlot {
@@ -95,20 +116,20 @@ pub struct AppCapture {
 }
 
 impl AppCapture {
-    pub fn start(app_id: String, sink: Sink16k, events: EventSink) -> Result<Self> {
-        let initial = find_app(&app_id)?.ok_or_else(|| anyhow::anyhow!("app {app_id} is not producing audio objects"))?;
+    pub fn start(app_id: String, mute_playback: bool, sample_rate: u32, sink: AudioSink, events: EventSink) -> Result<Self> {
+        find_app(&app_id)?.ok_or_else(|| anyhow::anyhow!("app {app_id} is not running"))?;
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
             active_gen: AtomicU64::new(0),
             last_audio: Mutex::new(Instant::now()),
             nonzero_seen: AtomicBool::new(false),
         });
-        let first = make_tap(&app_id, &initial.process_objs, 1, shared.clone(), sink.clone())?;
-        events(CaptureEvent::Started { process_objs: initial.process_objs.clone() });
         let stop2 = stop.clone();
+        // Core Audio can block while macOS waits for the user to answer a permission prompt.
+        // Start the supervisor before tapping so the armed recording can still be controlled.
         let thread = std::thread::Builder::new()
             .name(format!("mc-app-{app_id}"))
-            .spawn(move || supervise(app_id, first, shared, sink, events, stop2))?;
+            .spawn(move || supervise(app_id, mute_playback, sample_rate, shared, sink, events, stop2))?;
         Ok(Self { stop, thread: Some(thread) })
     }
 }
@@ -117,7 +138,10 @@ impl Drop for AppCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            t.thread().unpark();
+            if t.is_finished() {
+                let _ = t.join();
+            }
         }
     }
 }
@@ -126,7 +150,7 @@ fn find_app(app_id: &str) -> Result<Option<AppAudioInfo>> {
     Ok(list_apps()?.into_iter().find(|a| a.app_id == app_id))
 }
 
-fn make_tap(app_id: &str, objs: &[u32], gen: u64, shared: Arc<Shared>, sink: Sink16k) -> Result<TapSlot> {
+fn make_tap(app_id: &str, objs: &[u32], gen: u64, mute_playback: bool, sample_rate: u32, shared: Arc<Shared>, sink: AudioSink) -> Result<TapSlot> {
     let resampler: Mutex<Option<StreamResampler>> = Mutex::new(None);
     let raw: crate::tap::RawSink = Arc::new(move |samples: &[f32], rate: u32| {
         // The first audio of a newer generation switches the output to it (make-before-break).
@@ -142,7 +166,7 @@ fn make_tap(app_id: &str, objs: &[u32], gen: u64, shared: Arc<Shared>, sink: Sin
         }
         let mut guard = resampler.lock().unwrap();
         if guard.as_ref().map(|r| r.input_rate()) != Some(rate) {
-            *guard = StreamResampler::new(rate).ok();
+            *guard = StreamResampler::between(rate, sample_rate).ok();
         }
         if let Some(r) = guard.as_mut() {
             let out = r.push(samples);
@@ -152,24 +176,25 @@ fn make_tap(app_id: &str, objs: &[u32], gen: u64, shared: Arc<Shared>, sink: Sin
         }
     });
     let safe_name: String = app_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' }).collect();
-    let tap = ProcessTap::start(objs, &safe_name, raw)?;
+    let tap = ProcessTap::start(objs, &safe_name, mute_playback, raw)?;
     Ok(TapSlot { tap, gen, objs: objs.to_vec() })
 }
 
-fn supervise(app_id: String, first: TapSlot, shared: Arc<Shared>, sink: Sink16k, events: EventSink, stop: Arc<AtomicBool>) {
-    let mut current = first;
+fn supervise(app_id: String, mute_playback: bool, sample_rate: u32, shared: Arc<Shared>, sink: AudioSink, events: EventSink, stop: Arc<AtomicBool>) {
+    let mut current: Option<TapSlot> = None;
     let mut retiring: Vec<(TapSlot, Instant)> = Vec::new();
-    let mut gen = current.gen;
+    let mut gen = 0;
     let mut permission_reported = false;
     let mut missing_since: Option<Instant> = None;
     let started = Instant::now();
     let mut last_poll = Instant::now() - Duration::from_secs(10);
     while !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(200));
         // Old taps are dropped once the new one is active, or after 2 s regardless.
         let active = shared.active_gen.load(Ordering::Acquire);
         retiring.retain(|(slot, since)| !(slot.gen < active || since.elapsed() > Duration::from_secs(2)));
-        if last_poll.elapsed() < Duration::from_secs(2) {
+        let poll_interval = if current.is_some() { Duration::from_secs(2) } else { Duration::from_millis(200) };
+        if last_poll.elapsed() < poll_interval {
+            std::thread::park_timeout(Duration::from_millis(200));
             continue;
         }
         last_poll = Instant::now();
@@ -189,10 +214,25 @@ fn supervise(app_id: String, first: TapSlot, shared: Arc<Shared>, sink: Sink16k,
             continue;
         };
         missing_since = None;
+        if app.process_objs.is_empty() {
+            current = None;
+            continue;
+        }
+        let Some(slot) = current.as_ref() else {
+            gen += 1;
+            match make_tap(&app_id, &app.process_objs, gen, mute_playback, sample_rate, shared.clone(), sink.clone()) {
+                Ok(slot) => {
+                    current = Some(slot);
+                    events(CaptureEvent::Started { process_objs: app.process_objs });
+                }
+                Err(e) => events(CaptureEvent::Error(format!("could not attach to app audio: {e}"))),
+            }
+            continue;
+        };
         let quiet_for = shared.last_audio.lock().unwrap().elapsed();
-        let set_changed = app.process_objs != current.objs;
-        let dead = app.is_emitting && current.tap.callbacks() == 0 && current.tap.age() > Duration::from_secs(2);
-        let stalled = app.is_emitting && quiet_for > Duration::from_secs(3) && current.tap.age() > Duration::from_secs(3);
+        let set_changed = app.process_objs != slot.objs;
+        let dead = app.is_emitting && slot.tap.callbacks() == 0 && slot.tap.age() > Duration::from_secs(2);
+        let stalled = app.is_emitting && quiet_for > Duration::from_secs(3) && slot.tap.age() > Duration::from_secs(3);
         if !permission_reported
             && app.is_emitting
             && started.elapsed() > Duration::from_secs(3)
@@ -204,10 +244,11 @@ fn supervise(app_id: String, first: TapSlot, shared: Arc<Shared>, sink: Sink16k,
         if set_changed || dead || stalled {
             let reason = if set_changed { "process_set_changed" } else { "tap_stalled" };
             gen += 1;
-            match make_tap(&app_id, &app.process_objs, gen, shared.clone(), sink.clone()) {
+            match make_tap(&app_id, &app.process_objs, gen, mute_playback, sample_rate, shared.clone(), sink.clone()) {
                 Ok(slot) => {
-                    let old = std::mem::replace(&mut current, slot);
-                    retiring.push((old, Instant::now()));
+                    if let Some(old) = current.replace(slot) {
+                        retiring.push((old, Instant::now()));
+                    }
                     events(CaptureEvent::Retapped { reason: reason.into(), gap_ms: 0 });
                 }
                 Err(e) => events(CaptureEvent::Error(format!("retap failed: {e}"))),

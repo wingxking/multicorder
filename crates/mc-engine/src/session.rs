@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mc_asr::Pass;
-use mc_core::{new_id, samples_to_ms, EngineEvent, SourceKind, SummaryMode, TranscriptEvent, SAMPLE_RATE};
+use mc_core::{new_id, samples_to_ms, EngineEvent, RecordingFormat, SourceKind, SummaryMode, TranscriptEvent, SAMPLE_RATE};
 use mc_recorder::{SegmentInfo, SegmentWriter};
 use mc_vad::{Chunker, SpeechChunk};
 use tokio::sync::{mpsc, Notify};
@@ -18,10 +18,12 @@ use crate::Engine;
 pub const TAB_FRAME_SAMPLES: usize = 1600;
 /// Longest silence inserted for a seq gap before the frame is treated as a new stream position.
 const MAX_GAP_FILL_FRAMES: u32 = 600;
+const AUDIO_START_DB: f32 = -55.0;
 
 pub enum SessionMsg {
     Audio(Vec<f32>),
     Mode(SummaryMode),
+    Pause(bool),
     Gap { start_ms: i64, end_ms: i64, cause: String },
     Status(String, Option<String>),
     Stop { reason: String },
@@ -31,10 +33,15 @@ pub enum SessionMsg {
 pub struct SessionHandle {
     pub id: String,
     pub kind: SourceKind,
-    pub app_id: Option<String>,
+    pub capture_source_id: Option<String>,
+    /// Browser bundle id for tab sessions.
+    pub browser: Option<String>,
     pub tx: mpsc::Sender<SessionMsg>,
     /// Samples accepted so far (the session clock).
     samples: Arc<AtomicU64>,
+    wait_for_audio: bool,
+    format: RecordingFormat,
+    input: Mutex<CaptureInput>,
     /// Tab ingest: next expected seq and wall clock of the last frame.
     next_seq: AtomicU32,
     seq_started: std::sync::atomic::AtomicBool,
@@ -43,11 +50,46 @@ pub struct SessionHandle {
     dropped: AtomicUsize,
     #[cfg(target_os = "macos")]
     capture: Mutex<Option<mc_capture_macos::AppCapture>>,
+    #[cfg(target_os = "macos")]
+    microphone: Mutex<Option<mc_capture_macos::MicCapture>>,
+}
+
+struct CaptureInput {
+    pre_roll: Option<Vec<f32>>,
+    paused: bool,
+    closed: bool,
 }
 
 impl SessionHandle {
     pub fn session_ms(&self) -> i64 {
-        samples_to_ms(self.samples.load(Ordering::Relaxed) as usize)
+        self.format.duration_ms(self.samples.load(Ordering::Relaxed) as usize)
+    }
+
+    pub fn waiting_for_audio(&self) -> bool {
+        self.wait_for_audio && self.samples.load(Ordering::Relaxed) == 0
+    }
+
+    pub fn paused(&self) -> bool {
+        self.input.lock().unwrap().paused
+    }
+
+    pub fn capture_closed(&self) -> bool {
+        self.input.lock().unwrap().closed
+    }
+
+    pub fn set_paused(&self, paused: bool) -> anyhow::Result<()> {
+        let mut input = self.input.lock().unwrap();
+        anyhow::ensure!(!input.closed, "Recording is finishing");
+        if input.paused != paused {
+            self.tx.try_send(SessionMsg::Pause(paused)).map_err(|e| anyhow::anyhow!("session busy: {e}"))?;
+            input.paused = paused;
+            if paused {
+                if let Some(pre_roll) = &mut input.pre_roll {
+                    pre_roll.clear();
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn session_ms_at_wall(&self, wall_ms: f64) -> i64 {
@@ -58,11 +100,28 @@ impl SessionHandle {
         (self.last_wall_session_ms.load(Ordering::Relaxed) + (wall_ms as i64 - last_wall)).max(0)
     }
 
-    fn push_audio(&self, samples: Vec<f32>) {
+    fn push_audio(&self, mut samples: Vec<f32>) {
+        let mut input = self.input.lock().unwrap();
+        if input.paused || input.closed {
+            return;
+        }
+        if let Some(pre_roll) = input.pre_roll.as_mut() {
+            if mc_audio::rms_db(&samples) < AUDIO_START_DB {
+                let pre_roll_samples = self.format.sample_rate as usize / 5;
+                let tail = samples.len().saturating_sub(pre_roll_samples);
+                pre_roll.extend_from_slice(&samples[tail..]);
+                let excess = pre_roll.len().saturating_sub(pre_roll_samples);
+                pre_roll.drain(..excess);
+                return;
+            }
+            pre_roll.append(&mut samples);
+            samples = std::mem::take(pre_roll);
+        }
         let n = samples.len() as u64;
         match self.tx.try_send(SessionMsg::Audio(samples)) {
             Ok(()) => {
                 self.samples.fetch_add(n, Ordering::Relaxed);
+                input.pre_roll = None;
             }
             Err(_) => {
                 // Session task is behind: count it; the gap is recorded when it catches up.
@@ -73,6 +132,7 @@ impl SessionHandle {
 
     /// Accepts one tab frame; fills seq gaps with silence (recorded as a gap) and drops duplicates.
     pub fn ingest(&self, seq: u32, wall_ms: f64, pcm: &[i16]) -> anyhow::Result<u32> {
+        anyhow::ensure!(!self.capture_closed(), "Recording has ended");
         if !self.seq_started.swap(true, Ordering::AcqRel) {
             self.next_seq.store(seq, Ordering::Release);
         }
@@ -80,7 +140,7 @@ impl SessionHandle {
         if seq < expected {
             return Ok(expected.saturating_sub(1));
         }
-        if seq > expected {
+        if seq > expected && !self.waiting_for_audio() && !self.paused() {
             let missing = (seq - expected).min(MAX_GAP_FILL_FRAMES);
             let start_ms = self.session_ms();
             self.push_audio(vec![0.0; missing as usize * TAB_FRAME_SAMPLES]);
@@ -89,7 +149,7 @@ impl SessionHandle {
         let samples: Vec<f32> = pcm.iter().map(|s| mc_audio::i16_to_f32(*s)).collect();
         self.push_audio(samples);
         self.next_seq.store(seq + 1, Ordering::Release);
-        if wall_ms > 0.0 {
+        if wall_ms > 0.0 && !self.waiting_for_audio() && !self.paused() {
             self.last_wall_ms.store(wall_ms as i64, Ordering::Relaxed);
             self.last_wall_session_ms.store(self.session_ms(), Ordering::Relaxed);
         }
@@ -97,16 +157,9 @@ impl SessionHandle {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn attach_app_capture(self: &Arc<Self>, app_id: String) -> anyhow::Result<()> {
+    pub fn attach_app_capture(self: &Arc<Self>, app_id: String, mute_playback: bool) -> anyhow::Result<()> {
+        let sink = self.capture_sink();
         let me = Arc::downgrade(self);
-        let sink: mc_capture_macos::Sink16k = {
-            let me = me.clone();
-            Arc::new(move |samples: &[f32]| {
-                if let Some(h) = me.upgrade() {
-                    h.push_audio(samples.to_vec());
-                }
-            })
-        };
         let events: mc_capture_macos::EventSink = Arc::new(move |e| {
             let Some(h) = me.upgrade() else { return };
             use mc_capture_macos::CaptureEvent::*;
@@ -119,8 +172,31 @@ impl SessionHandle {
             };
             let _ = h.tx.try_send(msg);
         });
-        let cap = mc_capture_macos::AppCapture::start(app_id, sink, events)?;
+        let cap = mc_capture_macos::AppCapture::start(app_id, mute_playback, self.format.sample_rate, sink, events)?;
         *self.capture.lock().unwrap() = Some(cap);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_sink(self: &Arc<Self>) -> mc_capture_macos::AudioSink {
+        let handle = Arc::downgrade(self);
+        Arc::new(move |samples: &[f32]| {
+            if let Some(handle) = handle.upgrade() {
+                handle.push_audio(samples.to_vec());
+            }
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn attach_microphone(self: &Arc<Self>, id: &str) -> anyhow::Result<()> {
+        let handle = Arc::downgrade(self);
+        let events = Arc::new(move |event| {
+            if let (Some(handle), mc_capture_macos::CaptureEvent::Error(error)) = (handle.upgrade(), event) {
+                let _ = handle.tx.try_send(SessionMsg::Stop { reason: format!("capture_failed: {error}") });
+            }
+        });
+        let mic = mc_capture_macos::MicCapture::start(id, self.format.sample_rate, self.capture_sink(), events)?;
+        *self.microphone.lock().unwrap() = Some(mic);
         Ok(())
     }
 
@@ -129,18 +205,24 @@ impl SessionHandle {
         {
             let cap = self.capture.lock().unwrap().take();
             drop(cap);
+            let microphone = self.microphone.lock().unwrap().take();
+            drop(microphone);
         }
     }
 }
 
-pub fn spawn(engine: Arc<Engine>, id: String, kind: SourceKind, title: String, mode: SummaryMode, app_id: Option<String>) -> anyhow::Result<Arc<SessionHandle>> {
+pub fn spawn(engine: Arc<Engine>, id: String, kind: SourceKind, title: String, mode: SummaryMode, (capture_source_id, browser): (Option<String>, Option<String>), (wait_for_audio, format): (bool, RecordingFormat)) -> anyhow::Result<Arc<SessionHandle>> {
     let (tx, rx) = mpsc::channel(4096);
     let handle = Arc::new(SessionHandle {
         id: id.clone(),
         kind,
-        app_id,
+        capture_source_id,
+        browser,
         tx,
         samples: Arc::new(AtomicU64::new(0)),
+        wait_for_audio,
+        format,
+        input: Mutex::new(CaptureInput { pre_roll: wait_for_audio.then(Vec::new), paused: false, closed: false }),
         next_seq: AtomicU32::new(0),
         seq_started: Default::default(),
         last_wall_ms: AtomicI64::new(0),
@@ -148,12 +230,15 @@ pub fn spawn(engine: Arc<Engine>, id: String, kind: SourceKind, title: String, m
         dropped: AtomicUsize::new(0),
         #[cfg(target_os = "macos")]
         capture: Mutex::new(None),
+        #[cfg(target_os = "macos")]
+        microphone: Mutex::new(None),
     });
     let dir = engine.session_dir(&id);
-    let recorder = RecorderThread::start(engine.clone(), id.clone(), &dir)?;
+    let normalize = mc_audio::StreamResampler::new(format.sample_rate)?;
+    let recorder = RecorderThread::start(engine.clone(), id.clone(), &dir, format)?;
     let h2 = handle.clone();
     tokio::spawn(async move {
-        let task = SessionTask::new(engine.clone(), id.clone(), title, mode, recorder, h2.clone());
+        let task = SessionTask::new(engine.clone(), id.clone(), title, mode, recorder, h2.clone(), normalize);
         task.run(rx).await;
         h2.detach_capture();
         engine.forget(&id);
@@ -168,8 +253,8 @@ struct RecorderThread {
 }
 
 impl RecorderThread {
-    fn start(engine: Arc<Engine>, id: String, dir: &std::path::Path) -> anyhow::Result<Self> {
-        let mut writer = SegmentWriter::new(dir, 0, 0)?;
+    fn start(engine: Arc<Engine>, id: String, dir: &std::path::Path, format: RecordingFormat) -> anyhow::Result<Self> {
+        let mut writer = SegmentWriter::new(dir, 0, 0, format)?;
         let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<f32>>>();
         let join = std::thread::Builder::new().name(format!("mc-rec-{id}")).spawn(move || {
             let mut all = Vec::new();
@@ -217,6 +302,8 @@ struct SessionTask {
     handle: Arc<SessionHandle>,
     chunker: Option<Chunker>,
     total_samples: usize,
+    archive_samples: usize,
+    normalize: mc_audio::StreamResampler,
     /// Audio since the start of the current archive minute (for backfill before the segment is written).
     recent: VecDeque<f32>,
     pending: Arc<AtomicUsize>,
@@ -226,10 +313,14 @@ struct SessionTask {
     level_acc: Vec<f32>,
     dropout: mc_audio::DropoutDetector,
     reported_drops: usize,
+    paused: bool,
+    peaks: Vec<f32>,
+    peak: f32,
+    peak_samples: usize,
 }
 
 impl SessionTask {
-    fn new(engine: Arc<Engine>, id: String, title: String, mode: SummaryMode, recorder: RecorderThread, handle: Arc<SessionHandle>) -> Self {
+    fn new(engine: Arc<Engine>, id: String, title: String, mode: SummaryMode, recorder: RecorderThread, handle: Arc<SessionHandle>, normalize: mc_audio::StreamResampler) -> Self {
         let mut t = Self {
             engine,
             id,
@@ -239,6 +330,8 @@ impl SessionTask {
             handle,
             chunker: None,
             total_samples: 0,
+            archive_samples: 0,
+            normalize,
             recent: VecDeque::new(),
             pending: Arc::new(AtomicUsize::new(0)),
             pending_done: Arc::new(Notify::new()),
@@ -247,6 +340,10 @@ impl SessionTask {
             level_acc: Vec::new(),
             dropout: Default::default(),
             reported_drops: 0,
+            paused: false,
+            peaks: Vec::new(),
+            peak: 0.0,
+            peak_samples: 0,
         };
         if mode == SummaryMode::Live {
             t.start_live(false);
@@ -262,11 +359,13 @@ impl SessionTask {
                 msg = rx.recv() => match msg {
                     Some(SessionMsg::Audio(samples)) => self.on_audio(samples),
                     Some(SessionMsg::Mode(m)) => self.set_mode(m),
+                    Some(SessionMsg::Pause(paused)) => self.set_paused(paused),
                     Some(SessionMsg::Gap { start_ms, end_ms, cause }) => {
                         let _ = self.engine.store.add_gap(&self.id, start_ms, end_ms, &cause);
                         self.engine.emit(EngineEvent::Gap { session_id: self.id.clone(), start_ms, end_ms, cause });
                     }
                     Some(SessionMsg::Status(status, detail)) => {
+                        let status = if self.paused || self.awaiting_audio() { self.status().into() } else { status };
                         self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status, detail });
                     }
                     Some(SessionMsg::Stop { reason }) => { stop_reason = reason; break; }
@@ -281,12 +380,12 @@ impl SessionTask {
     fn on_tick(&mut self) {
         let dropped = self.handle.dropped.load(Ordering::Relaxed);
         if dropped > self.reported_drops {
-            let ms = samples_to_ms(dropped - self.reported_drops);
+            let ms = self.handle.format.duration_ms(dropped - self.reported_drops);
             let at = samples_to_ms(self.total_samples);
             let _ = self.engine.store.add_gap(&self.id, at, at + ms, "backpressure");
             self.reported_drops = dropped;
         }
-        if self.mode == SummaryMode::Live && self.engine.over_budget() {
+        if !self.paused && !self.awaiting_audio() && self.mode == SummaryMode::Live && self.engine.over_budget() {
             self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status: "capturing".into(), detail: Some("budget_exceeded: switched to after".into()) });
             let _ = self.engine.store.set_summary_mode(&self.id, "after");
             self.set_mode(SummaryMode::After);
@@ -297,12 +396,58 @@ impl SessionTask {
         }
     }
 
-    fn on_audio(&mut self, samples: Vec<f32>) {
-        if let Some(r) = &self.recorder {
-            r.push(samples.clone());
+    fn awaiting_audio(&self) -> bool {
+        self.handle.wait_for_audio && self.archive_samples == 0
+    }
+
+    fn status(&self) -> &'static str {
+        if self.paused { "paused" } else if self.awaiting_audio() { "waiting" } else { "capturing" }
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        if paused {
+            if let Some(mut chunker) = self.chunker.take() {
+                if let Some(chunk) = chunker.finish() {
+                    self.submit(chunk, Pass::Live, false);
+                }
+            }
+        } else if self.mode == SummaryMode::Live && self.chunker.is_none() {
+            self.chunker = Some(Chunker::new(self.total_samples));
         }
+        let status = self.status();
+        let _ = self.engine.store.set_status(&self.id, status, None);
+        self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status: status.into(), detail: None });
+    }
+
+    fn on_audio(&mut self, samples: Vec<f32>) {
+        if self.awaiting_audio() {
+            let _ = self.engine.store.set_status(&self.id, "capturing", None);
+            self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status: "capturing".into(), detail: None });
+        }
+        self.archive_samples += samples.len();
+        let normalized = self.normalize.push(&samples);
+        if let Some(r) = &self.recorder {
+            r.push(samples);
+        }
+        let samples = normalized;
         let seg_len = SAMPLE_RATE as usize * mc_recorder::SEGMENT_SECONDS;
         self.total_samples += samples.len();
+        for sample in &samples {
+            self.peak = self.peak.max(sample.abs());
+            self.peak_samples += 1;
+            if self.peak_samples == SAMPLE_RATE as usize / 40 {
+                self.peaks.push(std::mem::take(&mut self.peak));
+                self.peak_samples = 0;
+            }
+        }
+        if self.peaks.len() >= 8 {
+            self.engine.emit(EngineEvent::Waveform {
+                session_id: self.id.clone(),
+                peaks: std::mem::take(&mut self.peaks),
+                audio_ms: samples_to_ms(self.total_samples),
+            });
+        }
         self.recent.extend(&samples);
         let keep = self.total_samples % seg_len;
         while self.recent.len() > keep {
@@ -375,7 +520,7 @@ impl SessionTask {
                 }
             }
         }
-        self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status: "capturing".into(), detail: Some(format!("mode: {}", mode.as_str())) });
+        self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status: self.status().into(), detail: Some(format!("mode: {}", mode.as_str())) });
     }
 
     /// Queues one speech chunk; the result is stored and forwarded to the insight loop.
@@ -392,45 +537,13 @@ impl SessionTask {
             let result = rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("scheduler dropped job")));
             match result {
                 Ok(segments) => {
-                    let adapter = engine.scheduler().adapter();
-                    let minutes = (chunk.end_ms - chunk.start_ms) as f64 / 60_000.0;
-                    let usd = adapter.usd_per_minute() * minutes;
-                    let _ = engine.store.add_usage(Some(&id), &adapter.id(), "minutes", minutes, usd);
-                    let superseded = if correct { engine.store.supersede_range(&id, chunk.start_ms, chunk.end_ms).unwrap_or_default() } else { vec![] };
-                    let mut stored = Vec::new();
-                    for (i, s) in segments.into_iter().enumerate() {
-                        let start = chunk.start_ms + s.start_ms;
-                        let end = (chunk.start_ms + s.end_ms).max(start + 1);
-                        let e = TranscriptEvent {
-                            id: new_id(),
-                            session_id: id.clone(),
-                            start_ms: start,
-                            end_ms: end,
-                            media_start_ms: engine.store.media_time_at(&id, start).ok().flatten(),
-                            revision: 1,
-                            state: if correct { "corrected".into() } else { "final".into() },
-                            supersedes: if correct { superseded.get(i).cloned().or_else(|| superseded.first().cloned()) } else { None },
-                            text: s.text,
-                            lang: s.lang,
-                            engine: adapter.id(),
-                        };
-                        if let Err(err) = engine.store.insert_transcript(&e, pass.as_str()) {
-                            tracing::error!(error = %err, "transcript insert failed");
-                            continue;
-                        }
-                        engine.emit(EngineEvent::Transcript { session_id: id.clone(), event: e.clone() });
-                        stored.push(e);
-                    }
+                    let stored = store_segments(&engine, &id, chunk.start_ms, chunk.end_ms, segments, pass, correct);
                     tracing::debug!(session = %id, ms = started.elapsed().as_millis() as u64, n = stored.len(), "chunk transcribed");
                     if let (Some(tx), false) = (insight_tx, stored.is_empty()) {
                         let _ = tx.send(stored);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(session = %id, error = %e, "transcription failed");
-                    let _ = engine.store.add_gap(&id, chunk.start_ms, chunk.end_ms, "asr_failed");
-                    engine.emit(EngineEvent::Status { session_id: id.clone(), status: "capturing".into(), detail: Some(format!("asr_error: {e}")) });
-                }
+                Err(e) => record_asr_failure(&engine, &id, chunk.start_ms, chunk.end_ms, pass, &e),
             }
             pending.fetch_sub(1, Ordering::AcqRel);
             done.notify_waiters();
@@ -447,7 +560,8 @@ impl SessionTask {
         }
     }
 
-    async fn finish(mut self, reason: String, mut rx: mpsc::Receiver<SessionMsg>) {
+    async fn finish(mut self, mut reason: String, mut rx: mpsc::Receiver<SessionMsg>) {
+        self.handle.input.lock().unwrap().closed = true;
         self.handle.detach_capture();
         // Drain audio already queued before the stop.
         while let Ok(msg) = rx.try_recv() {
@@ -455,19 +569,26 @@ impl SessionTask {
                 self.on_audio(s);
             }
         }
+        if reason == "user" && self.awaiting_audio() {
+            reason = "no_audio".into();
+        }
         let failure = (reason != "user").then_some(reason.as_str());
         let _ = self.engine.store.set_status(&self.id, "stopping", failure);
         self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status: "stopping".into(), detail: Some(reason.clone()) });
-        let _ = self.engine.store.set_audio_ms(&self.id, samples_to_ms(self.total_samples));
+        let _ = self.engine.store.set_audio_ms(&self.id, self.handle.format.duration_ms(self.archive_samples));
         if let Some(r) = self.recorder.take() {
             let _ = tokio::task::spawn_blocking(move || r.finish()).await;
+        }
+        if self.mode != SummaryMode::Off && self.total_samples > 0 {
+            let _ = self.engine.store.set_status(&self.id, "processing", None);
+            self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status: "processing".into(), detail: None });
         }
         if let Some(mut ch) = self.chunker.take() {
             if let Some(c) = ch.finish() {
                 self.submit(c, Pass::Live, false);
             }
         }
-        match self.mode {
+        match if self.awaiting_audio() { SummaryMode::Off } else { self.mode } {
             SummaryMode::Off => {}
             SummaryMode::Live => {
                 self.wait_pending().await;
@@ -495,7 +616,7 @@ impl SessionTask {
         if let Some(t) = self.insight_task.take() {
             let _ = t.await;
         }
-        if self.mode != SummaryMode::Off {
+        if self.mode != SummaryMode::Off && !self.awaiting_audio() {
             if let Some(llm) = self.engine.llm() {
                 let lang = self.engine.config().output_lang;
                 let title = self.engine.store.session(&self.id).ok().flatten().map(|s| s.title).unwrap_or(self.title.clone());
@@ -517,6 +638,50 @@ impl SessionTask {
         let _ = self.engine.store.set_status(&self.id, final_status, failure);
         self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status: final_status.into(), detail: Some(reason) });
     }
+}
+
+/// Stores the segments of one transcribed chunk as transcript events and emits them.
+/// `correct` replaces live text over the same range (after-mode pass over a live session).
+pub(crate) fn store_segments(engine: &Arc<Engine>, id: &str, chunk_start: i64, chunk_end: i64, segments: Vec<mc_asr::AsrSegment>, pass: Pass, correct: bool) -> Vec<TranscriptEvent> {
+    let adapter = engine.scheduler().adapter();
+    let minutes = (chunk_end - chunk_start) as f64 / 60_000.0;
+    let _ = engine.store.add_usage(Some(id), &adapter.id(), "minutes", minutes, adapter.usd_per_minute() * minutes);
+    let superseded = if correct { engine.store.supersede_range(id, chunk_start, chunk_end).unwrap_or_default() } else { vec![] };
+    let mut stored = Vec::new();
+    for (i, s) in segments.into_iter().enumerate() {
+        let start = chunk_start + s.start_ms;
+        let end = (chunk_start + s.end_ms).max(start + 1);
+        let e = TranscriptEvent {
+            id: new_id(),
+            session_id: id.to_string(),
+            start_ms: start,
+            end_ms: end,
+            media_start_ms: engine.store.media_time_at(id, start).ok().flatten(),
+            revision: 1,
+            state: if correct { "corrected".into() } else { "final".into() },
+            supersedes: if correct { superseded.get(i).cloned().or_else(|| superseded.first().cloned()) } else { None },
+            text: s.text,
+            lang: s.lang,
+            engine: adapter.id(),
+        };
+        if let Err(err) = engine.store.insert_transcript(&e, pass.as_str()) {
+            tracing::error!(error = %err, "transcript insert failed");
+            continue;
+        }
+        engine.emit(EngineEvent::Transcript { session_id: id.to_string(), event: e.clone() });
+        stored.push(e);
+    }
+    stored
+}
+
+/// A failed chunk is kept for retry; recording is never affected (design: ASR is best-effort).
+pub(crate) fn record_asr_failure(engine: &Arc<Engine>, id: &str, start_ms: i64, end_ms: i64, pass: Pass, err: &anyhow::Error) {
+    tracing::warn!(session = %id, error = %err, "transcription failed; will retry");
+    let msg = err.to_string();
+    let _ = engine.store.add_asr_failure(id, start_ms, end_ms, pass.as_str(), &msg);
+    let short: String = msg.chars().take(160).collect();
+    let status = engine.store.session(id).ok().flatten().map(|s| s.status).unwrap_or_else(|| "capturing".into());
+    engine.emit(EngineEvent::Status { session_id: id.to_string(), status, detail: Some(format!("asr_unavailable: {short}")) });
 }
 
 /// Rolling key points: every 45 s of transcript or 400 words / 800 CJK characters, whichever first.

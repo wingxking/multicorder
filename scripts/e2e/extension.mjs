@@ -48,6 +48,7 @@ try {
   result.steps.service_worker = sw.url();
   const panel = await ctx.newPage();
   await panel.goto(`chrome-extension://${EXT_ID}/sidepanel.html`);
+  await panel.evaluate(() => chrome.storage.local.set({ settings: { appConnection: "app" } }));
   // Pairing through the native host.
   const pair = await panel.evaluate(() => chrome.runtime.sendMessage({ type: "pairing" }));
   result.steps.paired = !!pair?.pairing && pair.pairing.port === p.port;

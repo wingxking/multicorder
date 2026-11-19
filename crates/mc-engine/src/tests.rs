@@ -74,9 +74,98 @@ fn engine() -> (Arc<Engine>, std::path::PathBuf) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn armed_session_keeps_only_short_preroll_and_creates_no_silent_archive() {
+    let (engine, dir) = engine();
+    let arm = || {
+        engine.start_session_opts(
+            SourceSpec::ChromiumTab { tab_id: None, url: None, title: None, browser: None },
+            SummaryMode::Off,
+            None,
+            crate::StartOptions { wait_for_audio: true, ..Default::default() },
+        ).unwrap().0
+    };
+    let audible = arm();
+    let silent = arm();
+    assert_eq!(audible.status, "waiting");
+    assert_eq!(engine.sessions(true).unwrap().len(), 2);
+    feed(&engine, &audible.id, &silence(3.0)).await;
+    feed(&engine, &silent.id, &silence(3.0)).await;
+    assert_eq!(engine.store.session(&audible.id).unwrap().unwrap().status, "waiting");
+    assert!(engine.audio_wav(&audible.id).is_err());
+    assert!(engine.store.segments(&audible.id).unwrap().is_empty());
+
+    let sound = tone(440.0, 1.0);
+    for (i, frame) in sound.chunks(1600).enumerate() {
+        engine.ingest_tab_frame(&audible.id, 50 + i as u32, 0.0, frame).unwrap();
+    }
+    engine.stop_session(&audible.id, "user").unwrap();
+    engine.stop_session(&silent.id, "user").unwrap();
+    assert!(engine.wait_finished(&audible.id, Duration::from_secs(5)).await);
+    assert!(engine.wait_finished(&silent.id, Duration::from_secs(5)).await);
+
+    let wav = engine.audio_wav(&audible.id).unwrap();
+    let samples = mc_audio::decode_wav_to_16k(&wav).unwrap();
+    assert_eq!(samples.len(), 19_200);
+    assert!(mc_audio::is_all_zero(&samples[..3200]));
+    assert!(mc_audio::rms_db(&samples[3200..]) > -20.0);
+    assert!(engine.store.gaps(&audible.id).unwrap().is_empty());
+    assert_eq!(engine.store.session(&silent.id).unwrap().unwrap().failure.as_deref(), Some("no_audio"));
+    assert!(engine.store.segments(&silent.id).unwrap().is_empty());
+    assert!(engine.audio_wav(&silent.id).is_err());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn paused_audio_is_skipped_and_audio_only_can_be_transcribed_and_summarized() {
+    let (engine, dir) = engine();
+    let mut events = engine.subscribe();
+    let session = engine.start_session(
+        SourceSpec::ChromiumTab { tab_id: None, url: None, title: Some("Pause test".into()), browser: None },
+        SummaryMode::Off,
+        None,
+    ).unwrap();
+    let sound = tone(440.0, 1.0);
+    feed(&engine, &session.id, &sound).await;
+    engine.set_paused(&session.id, true).unwrap();
+    for (i, frame) in tone(880.0, 1.0).chunks(1600).enumerate() {
+        engine.ingest_tab_frame(&session.id, 10 + i as u32, 0.0, frame).unwrap();
+    }
+    engine.set_paused(&session.id, false).unwrap();
+    for (i, frame) in sound.chunks(1600).enumerate() {
+        engine.ingest_tab_frame(&session.id, 20 + i as u32, 0.0, frame).unwrap();
+    }
+    engine.stop_session(&session.id, "user").unwrap();
+    assert!(engine.wait_finished(&session.id, Duration::from_secs(5)).await);
+    assert_eq!(engine.store.session(&session.id).unwrap().unwrap().audio_ms, 2000);
+    assert!(engine.store.report(&session.id).unwrap().is_none());
+    let mut waveform = false;
+    let mut paused = false;
+    while let Ok(event) = events.try_recv() {
+        match event {
+            mc_core::EngineEvent::Waveform { peaks, .. } => waveform |= peaks.iter().any(|p| *p > 0.1),
+            mc_core::EngineEvent::Status { status, .. } => paused |= status == "paused",
+            _ => {}
+        }
+    }
+    assert!(waveform && paused);
+    assert!(engine.generate_summary(&session.id).await.is_err());
+    assert!(engine.retry_asr(&session.id).unwrap() > 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.transcript(&session.id).unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    engine.generate_summary(&session.id).await.unwrap();
+    let report = engine.store.report(&session.id).unwrap().unwrap();
+    assert!(report.body.contains("falcon"));
+    assert!(!report.body.contains("zebra"));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn two_tab_sessions_stay_isolated_live_and_after() {
     let (engine, dir) = engine();
-    let tab = |t: &str| SourceSpec::ChromiumTab { tab_id: None, url: Some("https://www.youtube.com/watch?v=abc123".into()), title: Some(t.into()) };
+    let tab = |t: &str| SourceSpec::ChromiumTab { tab_id: None, url: Some("https://www.youtube.com/watch?v=abc123".into()), title: Some(t.into()), browser: None };
     let a = engine.start_session(tab("A"), SummaryMode::Live, None).unwrap();
     let b = engine.start_session(tab("B"), SummaryMode::After, None).unwrap();
     assert_eq!(a.video_key.as_deref(), Some("youtube:abc123"));
@@ -127,7 +216,7 @@ async fn two_tab_sessions_stay_isolated_live_and_after() {
 #[tokio::test(flavor = "multi_thread")]
 async fn switching_to_live_backfills_and_gaps_are_recorded() {
     let (engine, dir) = engine();
-    let s = engine.start_session(SourceSpec::ChromiumTab { tab_id: None, url: None, title: Some("C".into()) }, SummaryMode::Off, None).unwrap();
+    let s = engine.start_session(SourceSpec::ChromiumTab { tab_id: None, url: None, title: Some("C".into()), browser: None }, SummaryMode::Off, None).unwrap();
     let mut audio = silence(0.5);
     audio.extend(tone(440.0, 2.0));
     audio.extend(silence(1.0));
@@ -155,4 +244,130 @@ fn video_keys() {
     assert_eq!(crate::video_key_of("https://youtu.be/xyz?t=1"), Some("youtube:xyz".into()));
     assert_eq!(crate::video_key_of("https://www.bilibili.com/video/BV1x/"), Some("bilibili:BV1x".into()));
     assert_eq!(crate::video_key_of("https://example.com"), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recording_a_browser_whose_tabs_are_recorded_is_refused() {
+    let (engine, dir) = engine();
+    let tab = engine
+        .start_session(
+            SourceSpec::ChromiumTab { tab_id: Some(7), url: None, title: Some("T".into()), browser: Some("com.google.Chrome".into()) },
+            SummaryMode::Off,
+            None,
+        )
+        .unwrap();
+    assert_eq!(tab.app_bundle_id.as_deref(), Some("com.google.Chrome"));
+    assert_eq!(engine.tab_sessions_in_browser("com.google.Chrome"), vec![tab.id.clone()]);
+    let err = engine.start_session(SourceSpec::MacApp { app_id: "com.google.Chrome".into() }, SummaryMode::Off, None).unwrap_err().to_string();
+    assert!(err.starts_with("duplicate_browser_tabs:"), "{err}");
+    assert!(err.contains(&tab.id));
+    // Other browsers are unaffected by the guard (they fail later only because the app is not running).
+    assert!(engine.tab_sessions_in_browser("com.apple.Safari").is_empty());
+    engine.stop_session(&tab.id, "user").unwrap();
+    assert!(engine.wait_finished(&tab.id, Duration::from_secs(10)).await);
+    assert!(engine.tab_sessions_in_browser("com.google.Chrome").is_empty());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Fails the first `fail` calls (provider down), then answers like ToneAsr.
+struct FlakyAsr {
+    fail: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl AsrAdapter for FlakyAsr {
+    fn id(&self) -> String {
+        "flaky".into()
+    }
+    fn usd_per_minute(&self) -> f64 {
+        0.0
+    }
+    async fn transcribe(&self, pcm: &[f32], lang: Option<&str>) -> anyhow::Result<Vec<AsrSegment>> {
+        use std::sync::atomic::Ordering;
+        if self.fail.load(Ordering::SeqCst) > 0 {
+            self.fail.fetch_sub(1, Ordering::SeqCst);
+            anyhow::bail!("provider down (test)");
+        }
+        ToneAsr.transcribe(pcm, lang).await
+    }
+}
+
+async fn wait_for(mut f: impl FnMut() -> bool, secs: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        if f() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_transcription_is_kept_retried_and_reported() {
+    let dir = std::env::temp_dir().join(format!("mc-engine-{}", mc_core::new_id()));
+    let cfg = Config { output_lang: "en".into(), ..Config::default() };
+    let flaky = Arc::new(FlakyAsr { fail: std::sync::atomic::AtomicUsize::new(1000) });
+    let engine = Engine::start_with(&dir, cfg, Some(flaky.clone()), Some(Arc::new(EchoLlm))).unwrap();
+    let mut events = engine.subscribe();
+    let s = engine
+        .start_session(SourceSpec::ChromiumTab { tab_id: None, url: None, title: Some("F".into()), browser: None }, SummaryMode::Live, None)
+        .unwrap();
+    let mut audio = silence(0.5);
+    for _ in 0..3 {
+        audio.extend(tone(440.0, 2.0));
+        audio.extend(silence(1.0));
+    }
+    feed(&engine, &s.id, &audio).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    engine.stop_session(&s.id, "user").unwrap();
+    assert!(engine.wait_finished(&s.id, Duration::from_secs(30)).await);
+    // Recording is intact, text is missing, failures are recorded and visible.
+    assert!(engine.transcript(&s.id).unwrap().is_empty());
+    let health = engine.asr_health(&s.id);
+    assert_eq!(health.state, "degraded");
+    assert_eq!(health.failed_chunks, 3);
+    assert!(!engine.audio_wav(&s.id).unwrap().is_empty());
+    let listed = engine.sessions_json(false).unwrap();
+    assert_eq!(listed[0]["asr"]["state"], "degraded");
+    // Provider comes back: a manual retry fills the transcript in and regenerates the report.
+    flaky.fail.store(0, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(engine.retry_asr(&s.id).unwrap(), 3);
+    assert!(wait_for(|| engine.asr_health(&s.id).failed_chunks == 0 && engine.store.report(&s.id).ok().flatten().is_some_and(|r| r.body.contains("falcon")), 20).await);
+    assert_eq!(engine.transcript(&s.id).unwrap().len(), 3);
+    let mut recovered = false;
+    while let Ok(e) = events.try_recv() {
+        if let mc_core::EngineEvent::Status { detail: Some(d), .. } = &e {
+            recovered |= d == "asr_recovered";
+        }
+    }
+    assert!(recovered, "asr_recovered was not emitted");
+    assert!(!engine.insights(&s.id).unwrap().is_empty());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_transcribes_a_recording_that_never_had_text() {
+    let (engine, dir) = engine();
+    let s = engine
+        .start_session(SourceSpec::ChromiumTab { tab_id: None, url: None, title: Some("Off".into()), browser: None }, SummaryMode::Off, None)
+        .unwrap();
+    let mut audio = silence(0.5);
+    audio.extend(tone(880.0, 2.0));
+    audio.extend(silence(1.0));
+    feed(&engine, &s.id, &audio).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    engine.stop_session(&s.id, "user").unwrap();
+    assert!(engine.wait_finished(&s.id, Duration::from_secs(30)).await);
+    assert!(engine.transcript(&s.id).unwrap().is_empty());
+    assert_eq!(engine.retry_asr(&s.id).unwrap(), 1);
+    assert!(wait_for(|| engine.transcript(&s.id).map(|t| t.len() == 1).unwrap_or(false), 20).await);
+    assert!(engine.transcript(&s.id).unwrap()[0].text.contains("zebra"));
+    assert_eq!(engine.asr_health(&s.id).state, "ok");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn asr_is_on_by_default() {
+    assert_eq!(SummaryMode::default(), SummaryMode::Live);
 }

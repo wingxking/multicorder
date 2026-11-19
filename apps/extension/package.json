@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@multicorder/ui": "workspace:*",
@@ -17,6 +18,7 @@
     "@types/react": "18.3.12",
     "@types/react-dom": "18.3.1",
     "esbuild": "0.24.0",
-    "typescript": "5.6.3"
+    "typescript": "5.6.3",
+    "vitest": "2.1.8"
   }
 }

@@ -1,12 +1,13 @@
 //! Audio helpers shared by capture, recording and transcription: resampling to 16 kHz, levels,
 //! dropout detection and WAV encoding.
 
-use mc_core::SAMPLE_RATE;
+use mc_core::{RecordingFormat, SAMPLE_RATE};
 use rubato::{FftFixedIn, Resampler};
 
-/// Streaming mono resampler to 16 kHz. Input arrives in arbitrary block sizes.
+/// Streaming mono sample-rate converter. Input arrives in arbitrary block sizes.
 pub struct StreamResampler {
     from: u32,
+    to: u32,
     inner: Option<FftFixedIn<f32>>,
     pending: Vec<f32>,
     chunk: usize,
@@ -14,13 +15,18 @@ pub struct StreamResampler {
 
 impl StreamResampler {
     pub fn new(from: u32) -> anyhow::Result<Self> {
+        Self::between(from, SAMPLE_RATE)
+    }
+
+    pub fn between(from: u32, to: u32) -> anyhow::Result<Self> {
+        anyhow::ensure!(from > 0 && to > 0, "Audio sample rates must be positive");
         let chunk = (from as usize / 100).max(1); // 10 ms of input per FFT block
-        let inner = if from == SAMPLE_RATE {
+        let inner = if from == to {
             None
         } else {
-            Some(FftFixedIn::<f32>::new(from as usize, SAMPLE_RATE as usize, chunk, 2, 1)?)
+            Some(FftFixedIn::<f32>::new(from as usize, to as usize, chunk, 2, 1)?)
         };
-        Ok(Self { from, inner, pending: Vec::new(), chunk })
+        Ok(Self { from, to, inner, pending: Vec::new(), chunk })
     }
 
     pub fn input_rate(&self) -> u32 {
@@ -32,7 +38,7 @@ impl StreamResampler {
             return input.to_vec();
         };
         self.pending.extend_from_slice(input);
-        let mut out = Vec::with_capacity(input.len() * SAMPLE_RATE as usize / self.from as usize + 16);
+        let mut out = Vec::with_capacity(input.len() * self.to as usize / self.from as usize + 16);
         while self.pending.len() >= self.chunk {
             let block: Vec<f32> = self.pending.drain(..self.chunk).collect();
             if let Ok(mut res) = inner.process(&[block], None) {
@@ -104,17 +110,27 @@ pub fn i16_to_f32(sample: i16) -> f32 {
 
 /// 16 kHz mono PCM16 WAV bytes.
 pub fn encode_wav(samples: &[f32]) -> anyhow::Result<Vec<u8>> {
+    encode_wav_with_format(samples, RecordingFormat::default())
+}
+
+pub fn pcm_sample(sample: f32, bits: u16) -> i32 {
+    let limit = 1 << (bits - 1);
+    ((sample * limit as f32) as i32).clamp(-limit, limit - 1)
+}
+
+pub fn encode_wav_with_format(samples: &[f32], format: RecordingFormat) -> anyhow::Result<Vec<u8>> {
+    format.validate()?;
     let spec = hound::WavSpec {
         channels: 1,
-        sample_rate: SAMPLE_RATE,
-        bits_per_sample: 16,
+        sample_rate: format.sample_rate,
+        bits_per_sample: format.bits_per_sample,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut cursor = std::io::Cursor::new(Vec::with_capacity(samples.len() * 2 + 44));
+    let mut cursor = std::io::Cursor::new(Vec::with_capacity(samples.len() * usize::from(format.bits_per_sample / 8) + 44));
     {
         let mut writer = hound::WavWriter::new(&mut cursor, spec)?;
         for s in samples {
-            writer.write_sample(f32_to_i16(*s))?;
+            writer.write_sample(pcm_sample(*s, format.bits_per_sample))?;
         }
         writer.finalize()?;
     }
@@ -137,9 +153,16 @@ pub fn decode_wav_to_16k(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
         .chunks(channels)
         .map(|frame| frame.iter().sum::<f32>() / channels as f32)
         .collect();
-    let mut resampler = StreamResampler::new(spec.sample_rate)?;
-    let mut out = resampler.push(&mono);
+    resample_to_16k(&mono, spec.sample_rate)
+}
+
+pub fn resample_to_16k(samples: &[f32], rate: u32) -> anyhow::Result<Vec<f32>> {
+    let mut resampler = StreamResampler::new(rate)?;
+    let mut out = resampler.push(samples);
+    // Flush the resampler's last partial block, then trim back to the input duration.
     out.extend(resampler.push(&vec![0.0; resampler.chunk]));
+    let expected = (samples.len() as u64 * SAMPLE_RATE as u64 / rate as u64) as usize;
+    out.truncate(expected);
     Ok(out)
 }
 
@@ -196,6 +219,6 @@ mod tests {
         let input = sine(16_000, 300.0, 0.5);
         let bytes = encode_wav(&input).unwrap();
         let back = decode_wav_to_16k(&bytes).unwrap();
-        assert!(back.len() >= input.len());
+        assert_eq!(back.len(), input.len());
     }
 }

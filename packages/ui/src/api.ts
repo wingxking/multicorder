@@ -7,6 +7,8 @@ export interface Session {
   id: string;
   kind: "chromium_tab" | "mac_app" | "mic";
   title: string;
+  app_bundle_id?: string | null;
+  capture_source_id?: string | null;
   url?: string | null;
   video_key?: string | null;
   status: string;
@@ -15,6 +17,10 @@ export interface Session {
   ended_at?: string | null;
   failure?: string | null;
   audio_ms: number;
+  sample_rate?: number;
+  bits_per_sample?: number;
+  /** Transcription health (Mac app sessions and standalone sessions). */
+  asr?: { state: "ok" | "degraded"; failed_chunks: number; failed_ms?: number };
 }
 
 export interface TranscriptEvent {
@@ -47,6 +53,7 @@ export interface Insight {
 export type EngineEvent =
   | { type: "status"; session_id: string; status: string; detail?: string | null }
   | { type: "level"; session_id: string; rms_db: number; silent: boolean }
+  | { type: "waveform"; session_id: string; peaks: number[]; audio_ms: number }
   | { type: "transcript"; session_id: string; event: TranscriptEvent }
   | { type: "insight"; session_id: string; insight: Insight }
   | { type: "gap"; session_id: string; start_ms: number; end_ms: number; cause: string }
@@ -101,6 +108,17 @@ export class Api {
   }
   missed(id: string, minutes: number) {
     return this.req<{ points: { text: string; evidence: Evidence[] }[]; from_ms: number; to_ms: number }>(`/v1/sessions/${id}/missed?minutes=${minutes}`);
+  }
+  retryAsr(id: string) {
+    return this.req<{ queued: number }>(`/v1/sessions/${id}/retry-asr`, { method: "POST" });
+  }
+  audioUrl(id: string) {
+    return `${this.base}/v1/sessions/${id}/audio`;
+  }
+  async audioBlob(id: string): Promise<Blob> {
+    const r = await fetch(this.audioUrl(id), { headers: { Authorization: `Bearer ${this.pairing.token}` } });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.blob();
   }
   marker(id: string) {
     return this.req(`/v1/sessions/${id}/markers`, { method: "POST", body: "{}" });

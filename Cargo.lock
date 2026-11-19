@@ -2263,12 +2263,15 @@ name = "mc-local-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "futures",
  "hex",
  "mc-asr",
+ "mc-audio",
  "mc-core",
  "mc-engine",
+ "mc-insight",
  "rand 0.8.8",
  "reqwest 0.12.28",
  "serde",
@@ -2422,6 +2425,7 @@ name = "multicorder-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cidre",
  "mc-core",
  "mc-engine",
  "mc-local-api",
@@ -2439,6 +2443,7 @@ name = "multicorder-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "mc-capture-macos",
  "mc-core",
  "mc-local-api",
  "serde_json",

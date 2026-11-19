@@ -44,10 +44,9 @@ class PcmTap extends AudioWorkletProcessor {
     this.levelN++;
     if (this.outPos === FRAME) {
       const buf = this.out.buffer.slice(0);
-      this.port.postMessage({ kind: "pcm", buf }, [buf]);
-      this.outPos = 0;
       const rms = Math.sqrt(this.levelAcc / this.levelN);
-      this.port.postMessage({ kind: "level", db: rms > 1e-6 ? 20 * Math.log10(rms) : -120 });
+      this.port.postMessage({ kind: "pcm", buf, db: rms > 1e-6 ? 20 * Math.log10(rms) : -120 }, [buf]);
+      this.outPos = 0;
       this.levelAcc = 0;
       this.levelN = 0;
     }

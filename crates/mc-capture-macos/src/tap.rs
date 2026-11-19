@@ -95,7 +95,7 @@ fn push_mixed<T: Copy>(ctx: &mut Ctx, data: &[T], channels: usize, conv: impl Fn
 
 impl ProcessTap {
     /// Taps exactly these Core Audio process objects (one app group).
-    pub fn start(process_objs: &[u32], name: &str, sink: RawSink) -> Result<Self> {
+    pub fn start(process_objs: &[u32], name: &str, mute_playback: bool, sink: RawSink) -> Result<Self> {
         if process_objs.is_empty() {
             return Err(anyhow!("no process objects to tap"));
         }
@@ -103,7 +103,7 @@ impl ProcessTap {
         let array = ns::Array::from_slice_retained(&numbers);
         let mut desc = ca::TapDesc::with_mono_mixdown_of_processes(&array);
         desc.set_private(true);
-        desc.set_mute_behavior(ca::TapMuteBehavior::Unmuted);
+        desc.set_mute_behavior(if mute_playback { ca::TapMuteBehavior::MuttedWhenTapped } else { ca::TapMuteBehavior::Unmuted });
         let tap = desc.create_process_tap().map_err(|e| anyhow!("create tap: {e:?}"))?;
         let asbd = tap.asbd().map_err(|e| anyhow!("tap format: {e:?}"))?;
         let sample_rate = asbd.sample_rate as u32;

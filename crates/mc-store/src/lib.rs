@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS sources (
   kind TEXT NOT NULL CHECK (kind IN ('chromium_tab','mac_app','mic')),
   title TEXT NOT NULL,
   app_bundle_id TEXT,
+  capture_source_id TEXT,
   canonical_url TEXT,
   video_key TEXT,
   created_at TEXT NOT NULL
@@ -33,6 +34,8 @@ CREATE TABLE IF NOT EXISTS capture_sessions (
   started_at TEXT NOT NULL,
   ended_at TEXT,
   failure TEXT,
+  sample_rate INTEGER NOT NULL DEFAULT 16000,
+  bits_per_sample INTEGER NOT NULL DEFAULT 16,
   audio_ms INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS audio_segments (
@@ -75,6 +78,11 @@ CREATE TABLE IF NOT EXISTS reports (
   session_id TEXT PRIMARY KEY, body TEXT NOT NULL, sections TEXT NOT NULL, is_final INTEGER NOT NULL,
   model TEXT, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS asr_failures (
+  session_id TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, pass TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 1, last_error TEXT, created_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, start_ms, pass)
+);
 CREATE TABLE IF NOT EXISTS usage_ledger (
   id TEXT PRIMARY KEY, session_id TEXT, provider TEXT NOT NULL, unit TEXT NOT NULL,
   qty REAL NOT NULL, usd REAL NOT NULL, at TEXT NOT NULL
@@ -88,6 +96,7 @@ pub struct SessionRow {
     pub kind: String,
     pub title: String,
     pub app_bundle_id: Option<String>,
+    pub capture_source_id: Option<String>,
     pub url: Option<String>,
     pub video_key: Option<String>,
     pub group_id: Option<String>,
@@ -99,6 +108,8 @@ pub struct SessionRow {
     pub ended_at: Option<String>,
     pub failure: Option<String>,
     pub audio_ms: i64,
+    pub sample_rate: u32,
+    pub bits_per_sample: u16,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,10 +146,23 @@ pub struct Marker {
     pub label: Option<String>,
 }
 
+/// A speech range whose transcription failed; retried until it succeeds.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AsrFailure {
+    pub session_id: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub pass: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub created_at: String,
+}
+
 pub struct NewSource<'a> {
     pub kind: &'a str,
     pub title: &'a str,
     pub app_bundle_id: Option<&'a str>,
+    pub capture_source_id: Option<&'a str>,
     pub url: Option<&'a str>,
     pub video_key: Option<&'a str>,
 }
@@ -157,6 +181,7 @@ fn session_from_row(r: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
         kind: r.get("kind")?,
         title: r.get("title")?,
         app_bundle_id: r.get("app_bundle_id")?,
+        capture_source_id: r.get("capture_source_id")?,
         url: r.get("canonical_url")?,
         video_key: r.get("video_key")?,
         group_id: r.get("group_id")?,
@@ -168,10 +193,12 @@ fn session_from_row(r: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
         ended_at: r.get("ended_at")?,
         failure: r.get("failure")?,
         audio_ms: r.get("audio_ms")?,
+        sample_rate: r.get("sample_rate")?,
+        bits_per_sample: r.get("bits_per_sample")?,
     })
 }
 
-const SESSION_SELECT: &str = "SELECT s.*, src.kind, src.title, src.app_bundle_id, src.canonical_url, src.video_key \
+const SESSION_SELECT: &str = "SELECT s.*, src.kind, src.title, src.app_bundle_id, src.capture_source_id, src.canonical_url, src.video_key \
      FROM capture_sessions s JOIN sources src ON src.id = s.source_id";
 
 fn event_from_row(r: &rusqlite::Row) -> rusqlite::Result<TranscriptEvent> {
@@ -210,10 +237,25 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let has_column = |table, column| tx.query_row("SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)", [table, column], |row| row.get::<_, bool>(0));
+        if !has_column("sources", "capture_source_id")? {
+            tx.execute("ALTER TABLE sources ADD COLUMN capture_source_id TEXT", [])?;
+            if has_column("sources", "capture_app_id")? {
+                tx.execute("UPDATE sources SET capture_source_id=capture_app_id WHERE capture_app_id IS NOT NULL", [])?;
+            }
+        }
+        if !has_column("capture_sessions", "sample_rate")? {
+            tx.execute("ALTER TABLE capture_sessions ADD COLUMN sample_rate INTEGER NOT NULL DEFAULT 16000", [])?;
+        }
+        if !has_column("capture_sessions", "bits_per_sample")? {
+            tx.execute("ALTER TABLE capture_sessions ADD COLUMN bits_per_sample INTEGER NOT NULL DEFAULT 16", [])?;
+        }
+        tx.commit()?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -231,12 +273,12 @@ impl Store {
     pub fn recover_on_start(&self) -> anyhow::Result<Vec<String>> {
         let db = self.db();
         let ids: Vec<String> = db
-            .prepare("SELECT id FROM capture_sessions WHERE status IN ('starting','capturing','reconnecting','stopping')")?
+            .prepare("SELECT id FROM capture_sessions WHERE status IN ('starting','waiting','capturing','paused','reconnecting','stopping','processing')")?
             .query_map([], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
         db.execute(
             "UPDATE capture_sessions SET status='stopped', failure=coalesce(failure,'app_restart'), ended_at=coalesce(ended_at,?1) \
-             WHERE status IN ('starting','capturing','reconnecting','stopping')",
+             WHERE status IN ('starting','waiting','capturing','paused','reconnecting','stopping','processing')",
             params![now_iso()],
         )?;
         Ok(ids)
@@ -245,17 +287,21 @@ impl Store {
     pub fn create_source(&self, s: &NewSource) -> anyhow::Result<String> {
         let id = mc_core::new_id();
         self.db().execute(
-            "INSERT INTO sources(id,kind,title,app_bundle_id,canonical_url,video_key,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![id, s.kind, s.title, s.app_bundle_id, s.url, s.video_key, now_iso()],
+            "INSERT INTO sources(id,kind,title,app_bundle_id,capture_source_id,canonical_url,video_key,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, s.kind, s.title, s.app_bundle_id, s.capture_source_id, s.url, s.video_key, now_iso()],
         )?;
         Ok(id)
     }
 
     pub fn create_session(&self, source_id: &str, summary_mode: &str, group_id: Option<&str>, track_role: Option<&str>) -> anyhow::Result<String> {
+        self.create_session_with_format(source_id, summary_mode, group_id, track_role, mc_core::RecordingFormat::default())
+    }
+
+    pub fn create_session_with_format(&self, source_id: &str, summary_mode: &str, group_id: Option<&str>, track_role: Option<&str>, format: mc_core::RecordingFormat) -> anyhow::Result<String> {
         let id = mc_core::new_id();
         self.db().execute(
-            "INSERT INTO capture_sessions(id,source_id,group_id,track_role,status,summary_mode,started_at) VALUES (?1,?2,?3,?4,'starting',?5,?6)",
-            params![id, source_id, group_id, track_role, summary_mode, now_iso()],
+            "INSERT INTO capture_sessions(id,source_id,group_id,track_role,status,summary_mode,started_at,sample_rate,bits_per_sample) VALUES (?1,?2,?3,?4,'starting',?5,?6,?7,?8)",
+            params![id, source_id, group_id, track_role, summary_mode, now_iso(), format.sample_rate, format.bits_per_sample],
         )?;
         Ok(id)
     }
@@ -315,7 +361,7 @@ impl Store {
 
     pub fn sessions(&self, active_only: bool, limit: i64) -> anyhow::Result<Vec<SessionRow>> {
         let db = self.db();
-        let filter = if active_only { "WHERE s.status IN ('starting','capturing','reconnecting','stopping')" } else { "" };
+        let filter = if active_only { "WHERE s.status IN ('starting','waiting','capturing','paused','reconnecting','stopping')" } else { "" };
         let sql = format!("{SESSION_SELECT} {filter} ORDER BY s.started_at DESC LIMIT ?1");
         let rows = db.prepare(&sql)?.query_map(params![limit], session_from_row)?.collect::<Result<_, _>>()?;
         Ok(rows)
@@ -542,6 +588,52 @@ impl Store {
         Ok(rows)
     }
 
+    /// Records a failed range, or bumps its attempt count and error if it is already known.
+    pub fn add_asr_failure(&self, session_id: &str, start_ms: i64, end_ms: i64, pass: &str, error: &str) -> anyhow::Result<()> {
+        let err: String = error.chars().take(300).collect();
+        self.db().execute(
+            "INSERT INTO asr_failures(session_id,start_ms,end_ms,pass,attempts,last_error,created_at) VALUES (?1,?2,?3,?4,1,?5,?6) \
+             ON CONFLICT(session_id,start_ms,pass) DO UPDATE SET attempts=attempts+1, last_error=excluded.last_error, end_ms=max(end_ms, excluded.end_ms)",
+            params![session_id, start_ms, end_ms, pass, err, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// Failed ranges, oldest first; all sessions when `session_id` is None.
+    pub fn asr_failures(&self, session_id: Option<&str>) -> anyhow::Result<Vec<AsrFailure>> {
+        let db = self.db();
+        let rows = db
+            .prepare("SELECT session_id,start_ms,end_ms,pass,attempts,last_error,created_at FROM asr_failures WHERE (?1 IS NULL OR session_id=?1) ORDER BY created_at, start_ms")?
+            .query_map(params![session_id], |r| {
+                Ok(AsrFailure {
+                    session_id: r.get(0)?,
+                    start_ms: r.get(1)?,
+                    end_ms: r.get(2)?,
+                    pass: r.get(3)?,
+                    attempts: r.get(4)?,
+                    last_error: r.get(5)?,
+                    created_at: r.get(6)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_asr_failure(&self, session_id: &str, start_ms: i64, pass: &str) -> anyhow::Result<()> {
+        self.db().execute("DELETE FROM asr_failures WHERE session_id=?1 AND start_ms=?2 AND pass=?3", params![session_id, start_ms, pass])?;
+        Ok(())
+    }
+
+    /// (failed chunks, failed milliseconds) per session, for sessions that have failures.
+    pub fn asr_failure_summary(&self) -> anyhow::Result<std::collections::HashMap<String, (i64, i64)>> {
+        let db = self.db();
+        let rows = db
+            .prepare("SELECT session_id, count(*), coalesce(sum(end_ms-start_ms),0) FROM asr_failures GROUP BY session_id")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
     pub fn add_usage(&self, session_id: Option<&str>, provider: &str, unit: &str, qty: f64, usd: f64) -> anyhow::Result<()> {
         self.db().execute(
             "INSERT INTO usage_ledger(id,session_id,provider,unit,qty,usd,at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
@@ -563,7 +655,7 @@ impl Store {
     pub fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
         let mut db = self.db();
         let tx = db.transaction()?;
-        for table in ["audio_segments", "gaps", "media_marks", "markers", "transcript_events", "insight_events", "reports"] {
+        for table in ["audio_segments", "gaps", "media_marks", "markers", "transcript_events", "insight_events", "reports", "asr_failures"] {
             tx.execute(&format!("DELETE FROM {table} WHERE session_id=?1"), params![session_id])?;
         }
         tx.execute("DELETE FROM transcript_fts WHERE session_id=?1", params![session_id])?;
@@ -596,7 +688,7 @@ mod tests {
 
     fn session(store: &Store, title: &str) -> String {
         let src = store
-            .create_source(&NewSource { kind: "chromium_tab", title, app_bundle_id: None, url: None, video_key: None })
+            .create_source(&NewSource { kind: "chromium_tab", title, app_bundle_id: None, capture_source_id: None, url: None, video_key: None })
             .unwrap();
         store.create_session(&src, "live", None, None).unwrap()
     }
@@ -657,6 +749,22 @@ mod tests {
         store.set_status(&a, "capturing", None).unwrap();
         assert_eq!(store.recover_on_start().unwrap(), vec![a.clone()]);
         assert_eq!(store.session(&a).unwrap().unwrap().failure.as_deref(), Some("app_restart"));
+    }
+
+    #[test]
+    fn asr_failures_upsert_and_summarise() {
+        let store = Store::open_memory().unwrap();
+        let a = session(&store, "A");
+        store.add_asr_failure(&a, 0, 4000, "live", "down").unwrap();
+        store.add_asr_failure(&a, 0, 4000, "live", "still down").unwrap();
+        store.add_asr_failure(&a, 5000, 7000, "live", "down").unwrap();
+        let f = store.asr_failures(Some(&a)).unwrap();
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].attempts, 2);
+        assert_eq!(f[0].last_error.as_deref(), Some("still down"));
+        assert_eq!(store.asr_failure_summary().unwrap()[&a], (2, 6000));
+        store.delete_asr_failure(&a, 0, "live").unwrap();
+        assert_eq!(store.asr_failures(None).unwrap().len(), 1);
     }
 
     #[test]

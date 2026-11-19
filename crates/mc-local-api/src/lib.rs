@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -22,7 +23,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use mc_core::{EngineEvent, SourceSpec, SummaryMode};
-use mc_engine::{Engine, ExportFormat};
+use mc_engine::{Engine, ExportFormat, StartOptions};
 use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
@@ -77,6 +78,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/sessions/{id}/missed", get(missed))
         .route("/v1/sessions/{id}/export", get(export))
         .route("/v1/sessions/{id}/markers", get(markers).post(add_marker))
+        .route("/v1/sessions/{id}/retry-asr", post(retry_asr))
+        .route("/v1/sessions/{id}/audio", get(session_audio))
+        .route("/v1/asr/transcribe", post(asr_transcribe).layer(DefaultBodyLimit::max(4 * 1024 * 1024)))
+        .route("/v1/llm/chat", post(llm_chat))
         .route("/v1/search", get(search))
         .route("/v1/events", get(events))
         .route("/v1/ingest/{id}", get(ws::ingest))
@@ -163,6 +168,9 @@ struct ApiError(anyhow::Error);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let msg = self.0.to_string();
+        if msg.starts_with("duplicate_browser_tabs:") {
+            return (StatusCode::CONFLICT, Json(json!({"error": msg, "code": "duplicate_browser_tabs"}))).into_response();
+        }
         let code = if msg.contains("not active") || msg.starts_with("no session") { StatusCode::NOT_FOUND } else { StatusCode::BAD_REQUEST };
         (code, Json(json!({"error": msg}))).into_response()
     }
@@ -199,11 +207,17 @@ struct CreateSession {
     summary_mode: Option<SummaryMode>,
     #[serde(default)]
     title: Option<String>,
+    /// Record even if this duplicates audio already recorded elsewhere (design 4.4.1).
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    wait_for_audio: bool,
 }
 
 async fn create_session(State(s): State<ApiState>, Json(body): Json<CreateSession>) -> ApiResult<Json<serde_json::Value>> {
-    let row = s.engine.start_session(body.source, body.summary_mode.unwrap_or_default(), body.title)?;
-    Ok(Json(json!({"session": row, "ingest_path": format!("/v1/ingest/{}", row.id)})))
+    let options = StartOptions { force: body.force, wait_for_audio: body.wait_for_audio, ..StartOptions::default() };
+    let (row, warnings) = s.engine.start_session_opts(body.source, body.summary_mode.unwrap_or_default(), body.title, options)?;
+    Ok(Json(json!({"session": row, "ingest_path": format!("/v1/ingest/{}", row.id), "warnings": warnings})))
 }
 
 #[derive(Deserialize)]
@@ -212,8 +226,7 @@ struct ListQ {
 }
 
 async fn list_sessions(State(s): State<ApiState>, Query(q): Query<ListQ>) -> ApiResult<Json<serde_json::Value>> {
-    let rows = s.engine.sessions(q.status.as_deref() == Some("active"))?;
-    Ok(Json(json!(rows)))
+    Ok(Json(json!(s.engine.sessions_json(q.status.as_deref() == Some("active"))?)))
 }
 
 async fn get_session(State(s): State<ApiState>, Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
@@ -224,7 +237,77 @@ async fn get_session(State(s): State<ApiState>, Path(id): Path<String>) -> ApiRe
         "backlog": s.engine.backlog(&id),
         "gaps": s.engine.store.gaps(&id)?,
         "has_report": s.engine.store.report(&id)?.is_some(),
+        "asr": s.engine.asr_health(&id),
     })))
+}
+
+async fn retry_asr(State(s): State<ApiState>, Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(json!({"queued": s.engine.retry_asr(&id)?})))
+}
+
+async fn session_audio(State(s): State<ApiState>, Path(id): Path<String>) -> ApiResult<Response> {
+    let wav = s.engine.audio_wav(&id)?;
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "audio/wav")
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"multicorder-{id}.wav\""))
+        .body(Body::from(wav))
+        .unwrap())
+}
+
+/// Longest audio accepted by the transcription service in one request.
+const MAX_TRANSCRIBE_MS: i64 = 30_500;
+const MAX_TRANSCRIBE_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct LangQ {
+    lang: Option<String>,
+}
+
+fn unavailable(code: &str, msg: String) -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": msg, "code": code}))).into_response()
+}
+
+/// Service API: one WAV chunk (16 kHz mono PCM16, ≤ 30 s) → timed segments. The same contract is
+/// served by the cloud service, so the extension can switch between them.
+async fn asr_transcribe(State(s): State<ApiState>, Query(q): Query<LangQ>, body: Bytes) -> Response {
+    if body.len() > MAX_TRANSCRIBE_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error": "audio larger than 2 MB"}))).into_response();
+    }
+    let pcm = match mc_audio::decode_wav_to_16k(&body) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("not a WAV file: {e}")}))).into_response(),
+    };
+    if mc_core::samples_to_ms(pcm.len()) > MAX_TRANSCRIBE_MS {
+        return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error": "audio longer than 30 s"}))).into_response();
+    }
+    match s.engine.transcribe_direct(&pcm, q.lang.as_deref().filter(|l| !l.is_empty())).await {
+        Ok((engine, segments)) => Json(json!({
+            "engine": engine,
+            "segments": segments.iter().map(|x| json!({"start_ms": x.start_ms, "end_ms": x.end_ms, "text": x.text})).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => unavailable("asr_unavailable", e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct ChatBody {
+    system: String,
+    user: String,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: u32,
+}
+
+fn default_max_tokens() -> u32 {
+    2000
+}
+
+/// Service API: one JSON-mode chat call through the configured providers (with fallback).
+async fn llm_chat(State(s): State<ApiState>, Json(b): Json<ChatBody>) -> Response {
+    match s.engine.chat_direct(&b.system, &b.user, b.max_tokens.min(4000)).await {
+        Ok((out, provider, model, tokens)) => Json(json!({"out": out, "usage": {"provider": provider, "model": model, "tokens": tokens}})).into_response(),
+        Err(e) => unavailable("llm_unavailable", e.to_string()),
+    }
 }
 
 #[derive(Deserialize)]
