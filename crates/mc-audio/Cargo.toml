@@ -1,0 +1,11 @@
+[package]
+name = "mc-audio"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rubato.workspace = true
+hound.workspace = true
+anyhow.workspace = true
+mc-core.workspace = true

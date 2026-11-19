@@ -1,0 +1,12 @@
+{
+  "name": "multicorder",
+  "private": true,
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "e2e": "bash scripts/e2e/run.sh all"
+  },
+  "devDependencies": {
+    "playwright-core": "1.49.1"
+  }
+}
