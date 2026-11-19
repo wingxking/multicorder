@@ -202,7 +202,7 @@ async function startOrOpen(tab: chrome.tabs.Tab | undefined) {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({ id: "mc-record", title: "Record this tab with Multicorder", contexts: ["page", "video", "audio"] });
+  chrome.contextMenus.create({ id: "mc-record", title: chrome.i18n.getMessage("menuRecord") || "Record this tab with Multicorder", contexts: ["page", "video", "audio"] });
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => {});
   void resumeRetries();
 });

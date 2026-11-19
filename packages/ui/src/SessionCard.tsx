@@ -1,7 +1,7 @@
 import React from "react";
 import { fmtTs, Insight, Session, SummaryMode, TranscriptEvent } from "./api";
 import { Icon } from "./icons";
-import { locale, t } from "./i18n";
+import { locale, t, tError } from "./i18n";
 
 export interface AsrHealth {
   state: "ok" | "degraded";
@@ -55,7 +55,7 @@ export function describeDetail(detail?: string | null): string | null {
   if (detail === "no_audio") return t("No sound was detected, so no audio was saved.");
   if (detail.startsWith("model_error") || detail.startsWith("report_error")) return t("Summary service unavailable; it will be retried.");
   if (detail.startsWith("mode:") || detail === "user" || detail.startsWith("retap")) return null;
-  return detail;
+  return tError(detail);
 }
 
 /** One card per audio source (shared by the extension side panel and the desktop app). */

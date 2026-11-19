@@ -1,5 +1,5 @@
 import React, { lazy, Suspense, useEffect, useId, useState } from "react";
-import { CardState, describeDetail, fmtTs, Icon, locale, Session, SummaryMode, t, WAITING_FOR_AUDIO } from "@multicorder/ui";
+import { CardState, describeDetail, fmtTs, Icon, locale, Session, SummaryMode, t, tError, WAITING_FOR_AUDIO } from "@multicorder/ui";
 
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 const AudioEditor = lazy(() => import("./AudioEditor"));
@@ -60,7 +60,7 @@ export function SavedClip({ clip, revision, invoke, flash, showSource, onDetails
       await invoke(command, { id: clip.id, ...args });
       flash(message);
     } catch (error) {
-      flash(String(error));
+      flash(tError(error));
     }
   }
 
@@ -70,7 +70,7 @@ export function SavedClip({ clip, revision, invoke, flash, showSource, onDetails
       const bytes = await invoke<ArrayBuffer>("load_recording_audio", { id: clip.id });
       setAudio(new Blob([bytes], { type: "audio/wav" }));
     } catch (error) {
-      flash(String(error));
+      flash(tError(error));
     } finally {
       setBusy(null);
     }
@@ -88,7 +88,7 @@ export function SavedClip({ clip, revision, invoke, flash, showSource, onDetails
       }
       setPreview(await invoke<TextPreview>("recording_preview", { id: clip.id }));
     } catch (error) {
-      flash(String(error));
+      flash(tError(error));
     } finally {
       setBusy(null);
     }
@@ -99,7 +99,7 @@ export function SavedClip({ clip, revision, invoke, flash, showSource, onDetails
       const path = await invoke<string>("export_recording_text", { id: clip.id, part, format });
       flash(t("Saved {path}", { path }));
     } catch (error) {
-      flash(String(error));
+      flash(tError(error));
     }
   }
 
@@ -192,7 +192,7 @@ export function RecordingPanel({ title, originalName, kind, session, card, clips
       await work();
       refresh();
     } catch (error) {
-      flash(String(error));
+      flash(tError(error));
     } finally {
       setBusy(false);
     }

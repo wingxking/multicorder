@@ -3,7 +3,7 @@
 
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { applyTheme, Icon, LangToggle, PreferenceControls, PREFS_CSS, t, THEME_CSS, ThemeToggle, useLang } from "@multicorder/ui";
+import { applyTheme, Icon, LangToggle, PreferenceControls, PREFS_CSS, t, tError, THEME_CSS, ThemeToggle, useLang } from "@multicorder/ui";
 import { CLOUD_URL, DEFAULTS, loadSettings, saveSettings, SERVICE_LABEL, ServiceEnv, Settings } from "./local/settings";
 
 function Choice<T extends string>({ value, options, onChange }: { value: T; options: { v: T; title: string; desc: string }[]; onChange: (v: T) => void }) {
@@ -127,7 +127,7 @@ function App() {
       <footer className="actions">
         <button className="btn btn-primary" onClick={() => void save()}>{t("Save")}</button>
         {msg && <span className="small" role="status">{msg}</span>}
-        {health && <span className={`chip ${health.ok ? "ok" : "warn"}`}><span className="dot" />{health.ok ? `${t("Service reachable")} · ${health.detail}` : `${t("Service unavailable")} · ${health.detail}`}</span>}
+        {health && <span className={`chip ${health.ok ? "ok" : "warn"}`}><span className="dot" />{health.ok ? `${t("Service reachable")} · ${tError(health.detail)}` : `${t("Service unavailable")} · ${tError(health.detail)}`}</span>}
       </footer>
     </div>
   );

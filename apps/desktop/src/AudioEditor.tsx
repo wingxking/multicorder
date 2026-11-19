@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import WaveSurfer from "wavesurfer.js";
 import Regions from "wavesurfer.js/dist/plugins/regions.esm.js";
 import Timeline from "wavesurfer.js/dist/plugins/timeline.esm.js";
-import { fmtTs, Icon, t } from "@multicorder/ui";
+import { fmtTs, Icon, t, tError } from "@multicorder/ui";
 
 const cssVar = (name: string, fallback: string) =>
   getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
@@ -51,9 +51,9 @@ export default function AudioEditor({ audio, onExport, onError }: {
     waveform.on("timeupdate", setTime);
     waveform.on("play", () => setPlaying(true));
     waveform.on("pause", () => setPlaying(false));
-    waveform.on("error", (failure) => setError(failure.message));
+    waveform.on("error", (failure) => setError(tError(failure)));
     let current = true;
-    void waveform.loadBlob(audio).catch((failure) => { if (current) setError(String(failure)); });
+    void waveform.loadBlob(audio).catch((failure) => { if (current) setError(tError(failure)); });
     return () => {
       current = false;
       disableSelection();
@@ -69,7 +69,7 @@ export default function AudioEditor({ audio, onExport, onError }: {
     try {
       await onExport(Math.floor(selection.start * 1000), Math.ceil(selection.end * 1000));
     } catch (failure) {
-      onError(String(failure));
+      onError(tError(failure));
     } finally {
       setSaving(false);
     }
@@ -78,7 +78,7 @@ export default function AudioEditor({ audio, onExport, onError }: {
   const play = (range?: Selection) => {
     if (!player.current) return;
     if (playing && !range) player.current.pause();
-    else void player.current.play(range?.start, range?.end).catch((failure) => onError(String(failure)));
+    else void player.current.play(range?.start, range?.end).catch((failure) => onError(tError(failure)));
   };
 
   return (

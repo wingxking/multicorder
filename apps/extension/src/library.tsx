@@ -3,7 +3,7 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { applyTheme, Icon, LangToggle, locale, t, THEME_CSS, ThemeToggle, useLang } from "@multicorder/ui";
+import { applyTheme, Icon, LangToggle, locale, t, tError, THEME_CSS, ThemeToggle, useLang } from "@multicorder/ui";
 import * as db from "./local/db";
 import { fmtTs, Insight, Seg } from "./local/insight";
 
@@ -73,9 +73,9 @@ function Detail({ s, onChanged }: { s: db.LocalSession; onChanged: () => void })
   };
   async function retry() {
     setBusy(true);
-    const r = await chrome.runtime.sendMessage({ type: "local-retry", sessionId: s.id }).catch((e) => ({ error: String(e) }));
+    const r = await chrome.runtime.sendMessage({ type: "local-retry", sessionId: s.id }).catch((e) => ({ error: tError(e) }));
     setBusy(false);
-    setMsg(r?.error ? t("Retry failed: {error}", { error: r.error }) : r?.remaining ? t("Service still unavailable — {n} part(s) waiting.", { n: r.remaining }) : r?.filled ? t("Filled in {n} part(s).", { n: r.filled }) : t("Nothing to retry."));
+    setMsg(r?.error ? t("Retry failed: {error}", { error: tError(r.error) }) : r?.remaining ? t("Service still unavailable — {n} part(s) waiting.", { n: r.remaining }) : r?.filled ? t("Filled in {n} part(s).", { n: r.filled }) : t("Nothing to retry."));
     load();
     onChanged();
   }
@@ -90,7 +90,7 @@ function Detail({ s, onChanged }: { s: db.LocalSession; onChanged: () => void })
         {statusChip(s)}
       </header>
       {missing > 0 && (
-        <div className="banner warn"><Icon name="warn" /><span className="grow">{t("{n} part(s) of this recording are not transcribed yet ({error}). The audio is saved; text fills in automatically when the service is back.", { n: missing, error: s.last_error || t("service unavailable") })}</span><button className="btn btn-sm" disabled={busy} onClick={() => void retry()}><Icon name="retry" size={13} />{busy ? t("Retrying…") : t("Retry now")}</button></div>
+        <div className="banner warn"><Icon name="warn" /><span className="grow">{t("{n} part(s) of this recording are not transcribed yet ({error}). The audio is saved; text fills in automatically when the service is back.", { n: missing, error: s.last_error ? tError(s.last_error) : t("service unavailable") })}</span><button className="btn btn-sm" disabled={busy} onClick={() => void retry()}><Icon name="retry" size={13} />{busy ? t("Retrying…") : t("Retry now")}</button></div>
       )}
       {msg && <p className="small muted" role="status">{msg}</p>}
       {audioUrl ? <audio controls src={audioUrl} /> : <p className="muted small">{s.status === "waiting" ? t("Recording starts when this tab plays sound.") : s.failure === "no_audio" ? t("No sound was detected, so no audio was saved.") : t("Audio is being written…")}</p>}
@@ -101,7 +101,7 @@ function Detail({ s, onChanged }: { s: db.LocalSession; onChanged: () => void })
         {audioUrl && <a className="btn" href={audioUrl} download={`multicorder-${s.id}.webm`}><Icon name="download" size={13} />{t("Audio")}</a>}
         {!missing && s.status === "stopped" && s.failure !== "no_audio" && <button className="btn" disabled={busy} onClick={() => void retry()}><Icon name="retry" size={13} />{t("Transcribe again")}</button>}
         <span className="grow" />
-        <button className="btn btn-ghost btn-danger" onClick={() => { if (confirm(t("Delete this recording, its transcript and summary?"))) db.deleteSession(s.id).then(onChanged).catch((e) => setMsg(String(e))); }}><Icon name="trash" size={13} />{t("Delete")}</button>
+        <button className="btn btn-ghost btn-danger" onClick={() => { if (confirm(t("Delete this recording, its transcript and summary?"))) db.deleteSession(s.id).then(onChanged).catch((e) => setMsg(tError(e))); }}><Icon name="trash" size={13} />{t("Delete")}</button>
       </div>
       <div className="cols">
         <section className="panel-block">

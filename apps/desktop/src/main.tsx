@@ -6,7 +6,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ACTIVE_SESSION_STATUSES as ACTIVE, CARD_CSS, EngineEvent, fmtTs, Icon, Insight, LangToggle, locale, PreferenceControls, PREFS_CSS, Session, SummaryMode, t, THEME_CSS, ThemeToggle, TranscriptEvent, useLang, useToast, WAITING_FOR_AUDIO } from "@multicorder/ui";
+import { ACTIVE_SESSION_STATUSES as ACTIVE, CARD_CSS, EngineEvent, fmtTs, Icon, Insight, LangToggle, locale, PreferenceControls, PREFS_CSS, Session, SummaryMode, t, tError, THEME_CSS, ThemeToggle, TranscriptEvent, useLang, useToast, WAITING_FOR_AUDIO } from "@multicorder/ui";
 import { mockInvoke } from "./mock";
 import { DEFAULT_RECORDING_FORMAT, LiveCard, RECORDING_CSS, RecordingFormat, RecordingPanel, SavedClip } from "./RecordingPanel";
 
@@ -176,7 +176,7 @@ function Live({ activeOnly, selected, setSelected, sessions, cards, remarks, sav
       if (result?.session?.status === "waiting" && !source.app?.is_emitting) flash(t(WAITING_FOR_AUDIO));
       refresh();
     } catch (failure) {
-      flash(String(failure));
+      flash(tError(failure));
     } finally {
       setStarting((keys) => keys.filter((key) => key !== source.key));
     }
@@ -322,7 +322,7 @@ function Detail({ session, refresh, flash }: { session: Row; refresh: () => void
       const r = await invoke<{ queued: number }>("retry_asr", { id: session.id });
       flash(r?.queued ? t("Retrying {n} part(s)…", { n: r.queued }) : t("Nothing to retry."));
     } catch (e) {
-      flash(t("Retry failed: {error}", { error: String(e) }));
+      flash(t("Retry failed: {error}", { error: tError(e) }));
     } finally {
       setBusy(false);
       refresh();
@@ -334,7 +334,7 @@ function Detail({ session, refresh, flash }: { session: Row; refresh: () => void
       await invoke("delete_session", { id: session.id });
       refresh();
     } catch (e) {
-      flash(String(e));
+      flash(tError(e));
     }
   };
   const jump = (id: string) => {
@@ -356,9 +356,9 @@ function Detail({ session, refresh, flash }: { session: Row; refresh: () => void
       )}
       <div className="toolbar">
         {(["md", "srt", "vtt", "json"] as const).map((f) => (
-          <button key={f} className="btn btn-sm" onClick={() => invoke<string>("export", { id: session.id, format: f }).then((p) => flash(t("Saved {path}", { path: p }))).catch((e) => flash(String(e)))}><Icon name="download" size={13} />{f.toUpperCase()}</button>
+          <button key={f} className="btn btn-sm" onClick={() => invoke<string>("export", { id: session.id, format: f }).then((p) => flash(t("Saved {path}", { path: p }))).catch((e) => flash(tError(e)))}><Icon name="download" size={13} />{f.toUpperCase()}</button>
         ))}
-        {!waiting && !empty && <button className="btn btn-sm" onClick={() => invoke<string>("export_audio", { id: session.id }).then((p) => flash(t("Saved {path}", { path: p }))).catch((e) => flash(t("Could not save audio: {error}", { error: String(e) })))}><Icon name="download" size={13} />{t("Audio (WAV)")}</button>}
+        {!waiting && !empty && <button className="btn btn-sm" onClick={() => invoke<string>("export_audio", { id: session.id }).then((p) => flash(t("Saved {path}", { path: p }))).catch((e) => flash(t("Could not save audio: {error}", { error: tError(e) })))}><Icon name="download" size={13} />{t("Audio (WAV)")}</button>}
         {!missing && !active && !empty && <button className="btn btn-sm" disabled={busy} onClick={() => void retry()}><Icon name="retry" size={13} />{t("Transcribe again")}</button>}
         <span className="grow" />
         {!active && <button className="btn btn-sm btn-ghost btn-danger" onClick={() => void remove()}><Icon name="trash" size={13} />{t("Delete")}</button>}

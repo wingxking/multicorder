@@ -1,0 +1,17 @@
+{
+  "extName": {
+    "message": "Multicorder"
+  },
+  "extDescription": {
+    "message": "Record several browser tabs at once — each with its own recording, live captions and summary. Works on its own; connects to the Multicorder Mac app when it is running."
+  },
+  "actionTitle": {
+    "message": "Record this tab"
+  },
+  "commandToggle": {
+    "message": "Start recording this tab"
+  },
+  "menuRecord": {
+    "message": "Record this tab with Multicorder"
+  }
+}

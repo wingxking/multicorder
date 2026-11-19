@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Icon } from "./icons";
-import { getLang, LangPref, setLangPref, t, useLang, useLangPref } from "./i18n";
+import { LangPref, LANGUAGES, setLangPref, t, useLang, useLangPref } from "./i18n";
 import { saveThemePref, ThemePref, useThemePref } from "./theme";
 
 const NEXT: Record<ThemePref, ThemePref> = { system: "light", light: "dark", dark: "system" };
@@ -31,10 +31,13 @@ export function ThemeToggle({ persist }: { persist?: (p: ThemePref) => void }) {
 /** Switches between English and Chinese (an explicit choice; "follow system" lives in Settings). */
 export function LangToggle() {
   const lang = useLang();
-  const label = lang === "zh" ? "Switch to English" : "切换到中文";
+  // Two languages: flip between them. More: step through LANGUAGES in order.
+  const i = LANGUAGES.findIndex((l) => l.code === lang);
+  const next = LANGUAGES[(i + 1) % LANGUAGES.length];
+  const label = t("Switch to {language}", { language: next.label });
   return (
-    <button className="btn btn-ghost text-btn" title={label} aria-label={label} onClick={() => setLangPref(getLang() === "zh" ? "en" : "zh")}>
-      {lang === "zh" ? "EN" : "中"}
+    <button className="btn btn-ghost text-btn" title={label} aria-label={label} onClick={() => setLangPref(next.code)}>
+      {next.short}
     </button>
   );
 }
@@ -45,7 +48,7 @@ export function PreferenceControls({ persistTheme }: { persistTheme?: (p: ThemeP
   const langPref = useLangPref();
   useLang();
   const themes: [ThemePref, string][] = [["system", "System"], ["light", "Light"], ["dark", "Dark"]];
-  const langs: [LangPref, string][] = [["system", t("System")], ["en", "English"], ["zh", "中文"]];
+  const langs: [LangPref, string][] = [["system", t("System")], ...LANGUAGES.map((l): [LangPref, string] => [l.code, l.label])];
   return (
     <div className="prefs">
       <div className="pref-row">

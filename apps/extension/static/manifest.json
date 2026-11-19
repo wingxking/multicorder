@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Multicorder",
+  "name": "__MSG_extName__",
   "version": "0.3.0",
-  "description": "Record several browser tabs at once \u2014 each with its own recording, live captions and summary. Works on its own; connects to the Multicorder Mac app when it is running.",
+  "description": "__MSG_extDescription__",
   "minimum_chrome_version": "116",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuD2kdy3GVQK7LPFxoXS+jXVLaVYzDImbpaMaS8H+lrgSRUWguZ+h4ofKNu1up9SdjpkrwS19EpG1EU9oCzEFk+zS+GQ/6c3DVL9qn7DjRjmDmJDP14+kRa0KmqYXC0k8oP/la3bknqdX/QfsVxspiSuuC7pT6KcuECt5B1Soh1DDNSvk7F6VekpuhpTSupXiv9tavuuXTat7yutpQZa8PQyY26t0Inbt9GjKG/hGOx+/Z3oQHCnxTorYzYR6mFna25hUjh+yrdL9O34pZ/tyQpMShjDNn7wZ01OxUweD7hkQZQoWsxFSX0AwGqHYzjTiZ1M01y+w5uTGfnnZG1vrhwIDAQAB",
   "background": {
@@ -10,7 +10,7 @@
     "type": "module"
   },
   "action": {
-    "default_title": "Record this tab",
+    "default_title": "__MSG_actionTitle__",
     "default_icon": {
       "16": "icons/16.png",
       "32": "icons/32.png"
@@ -42,7 +42,7 @@
         "default": "Alt+Shift+R",
         "mac": "Alt+Shift+R"
       },
-      "description": "Start recording this tab"
+      "description": "__MSG_commandToggle__"
     }
   },
   "host_permissions": [
@@ -57,5 +57,6 @@
   "optional_host_permissions": [
     "https://*/*"
   ],
-  "options_page": "options.html"
+  "options_page": "options.html",
+  "default_locale": "en"
 }

@@ -1,0 +1,17 @@
+{
+  "extName": {
+    "message": "Multicorder"
+  },
+  "extDescription": {
+    "message": "同时录制多个浏览器标签页，每个标签页都有独立的录音、实时字幕和摘要。可单独使用；Mac 版 Multicorder 运行时会自动连接。"
+  },
+  "actionTitle": {
+    "message": "录制此标签页"
+  },
+  "commandToggle": {
+    "message": "开始录制此标签页"
+  },
+  "menuRecord": {
+    "message": "用 Multicorder 录制此标签页"
+  }
+}

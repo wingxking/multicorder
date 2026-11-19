@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Icon, t, WAITING_FOR_AUDIO } from "@multicorder/ui";
+import { Icon, t, tError, WAITING_FOR_AUDIO } from "@multicorder/ui";
 import { AUDIO_START_DB } from "./protocol";
 
 type SourceStatus = { status: string; levelDb?: number };
@@ -52,9 +52,9 @@ export function TabSources({ recordings, onNotice }: { recordings: Record<string
       const result = await chrome.runtime.sendMessage({ type: "start-current", tabId: tab.id });
       if (result?.error) onNotice(/grant|permission|has not been invoked|activeTab/i.test(result.error)
         ? t("Click the pinned Multicorder toolbar icon to give Chrome permission to record this tab.")
-        : result.error);
+        : tError(result.error));
     } catch (error) {
-      onNotice(String(error));
+      onNotice(tError(error));
     }
   }
 

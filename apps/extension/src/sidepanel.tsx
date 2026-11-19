@@ -3,7 +3,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ACTIVE_SESSION_STATUSES, Api, applyTheme, CARD_CSS, CardState, EngineEvent, Icon, LangToggle, Session, SessionCard, SummaryMode, t, THEME_CSS, ThemeToggle, useLang, useToast } from "@multicorder/ui";
+import { ACTIVE_SESSION_STATUSES, Api, applyTheme, CARD_CSS, CardState, EngineEvent, Icon, LangToggle, Session, SessionCard, SummaryMode, t, tError, THEME_CSS, ThemeToggle, useLang, useToast } from "@multicorder/ui";
 import * as db from "./local/db";
 import { loadSettings, saveSettings, SERVICE_LABEL, ServiceEnv } from "./local/settings";
 import { TabSources } from "./TabSources";
@@ -169,7 +169,7 @@ function App() {
       const r = c.backend === "app" ? await api!.missed(c.session.id, 5) : await chrome.runtime.sendMessage({ type: "local-missed", sessionId: c.session.id, minutes: 5 });
       setMissed((p) => ({ ...p, [c.session.id]: r?.points?.length ? r.points.map((x: { text: string }) => x.text) : [t("Nothing new in the last 5 minutes.")] }));
     } catch (e) {
-      flash(String(e));
+      flash(tError(e));
     }
   }
 
@@ -182,10 +182,10 @@ function App() {
         flash(r.queued ? t("Retrying {n} part(s)…", { n: r.queued }) : t("Nothing to retry."));
       } else {
         const r = await chrome.runtime.sendMessage({ type: "local-retry", sessionId: c.session.id });
-        flash(r?.error ? t("Retry failed: {error}", { error: r.error }) : r?.remaining ? t("Service still unavailable — {n} part(s) waiting.", { n: r.remaining }) : r?.filled ? t("Filled in {n} part(s).", { n: r.filled }) : t("Nothing to retry."));
+        flash(r?.error ? t("Retry failed: {error}", { error: tError(r.error) }) : r?.remaining ? t("Service still unavailable — {n} part(s) waiting.", { n: r.remaining }) : r?.filled ? t("Filled in {n} part(s).", { n: r.filled }) : t("Nothing to retry."));
       }
     } catch (e) {
-      flash(t("Retry failed: {error}", { error: String(e) }));
+      flash(t("Retry failed: {error}", { error: tError(e) }));
     } finally {
       setCards((p) => ({ ...p, [c.session.id]: { ...p[c.session.id], retrying: false } }));
       void refresh();
@@ -203,7 +203,7 @@ function App() {
       if (f && f.size) save(`multicorder-${c.session.id}.webm`, f);
       else flash(t("No audio recorded yet."));
     } catch (e) {
-      flash(t("Could not save audio: {error}", { error: String(e) }));
+      flash(t("Could not save audio: {error}", { error: tError(e) }));
     }
   }
 
