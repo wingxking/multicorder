@@ -262,13 +262,17 @@ pub async fn report(store: &Store, llm: &Arc<dyn Llm>, session_id: &str, lang: &
     let points: Vec<Value> = store.latest_insights(session_id, false)?.iter().map(|i| json!({"type": i.kind, "text": i.text})).collect();
     let system = format!(
         "Write the final report for ONE audio source in {}. Return only JSON: \
-{{\"summary\":\"2-3 sentences\",\"sections\":[{{\"heading\":\"...\",\"bullets\":[{{\"text\":\"...\",\"evidence\":[\"<segment id>\"]}}]}}]}}. \
+{{\"title\":\"a short, specific name for this recording (at most 8 words, no quotes or date)\",\"summary\":\"2-3 sentences\",\"sections\":[{{\"heading\":\"...\",\"bullets\":[{{\"text\":\"...\",\"evidence\":[\"<segment id>\"]}}]}}]}}. \
 Use 3-6 sections such as key points, numbers and announcements, decisions, open questions, action items. \
 Every bullet cites segment ids from the input; copy numbers exactly as in the cited segments; do not invent facts.",
         lang_name(lang)
     );
     let input = json!({"title": title, "rolling_points": points, "segments": segs});
     let (out, usage) = llm.chat_json(&system, &input.to_string(), 4000).await?;
+    if let Some(name) = out["title"].as_str() {
+        let name: String = name.trim().trim_matches(['"', '“', '”', '「', '」']).chars().take(80).collect();
+        store.set_auto_name(session_id, &name)?;
+    }
     let mut md = format!("# {title}\n\n");
     if let Some(s) = out["summary"].as_str() {
         md.push_str(s.trim());

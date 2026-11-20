@@ -18,6 +18,7 @@ const paths: Record<string, React.ReactNode> = {
   stop: <rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor" stroke="none" />,
   tab: <><rect x="2" y="3" width="12" height="10" rx="1.5" /><path d="M2 6h12" /></>,
   app: <><rect x="2.5" y="2.5" width="11" height="11" rx="2.5" /><path d="M6 6h4v4H6z" /></>,
+  captions: <><rect x="2" y="3.5" width="12" height="9" rx="1.6" /><path d="M7.2 6.9a1.5 1.5 0 1 0 0 2.2M11.4 6.9a1.5 1.5 0 1 0 0 2.2" /></>,
   mic: <><rect x="6" y="2" width="4" height="7" rx="2" /><path d="M4 7.5a4 4 0 008 0M8 11.5V14" /></>,
   flag: <><path d="M4 14V2.5" /><path d="M4 3h7l-1.5 2.5L11 8H4" /></>,
   clock: <><circle cx="8" cy="8" r="5.5" /><path d="M8 5v3l2 1.5" /></>,

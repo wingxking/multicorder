@@ -31,7 +31,7 @@ pub struct ProcessTap {
     // Drop order matters: stop the device, then free the context, then destroy the tap.
     _device: ca::hardware::StartedDevice<ca::AggregateDevice>,
     _ctx: Box<Ctx>,
-    _tap: ca::TapGuard,
+    tap: ca::TapGuard,
     stop: Arc<AtomicBool>,
     pump: Option<std::thread::JoinHandle<()>>,
     callbacks: Arc<AtomicU64>,
@@ -152,7 +152,7 @@ impl ProcessTap {
         Ok(Self {
             _device: device,
             _ctx: ctx,
-            _tap: tap,
+            tap,
             stop,
             pump: Some(pump),
             callbacks,
@@ -160,6 +160,14 @@ impl ProcessTap {
             sample_rate,
             started: Instant::now(),
         })
+    }
+
+    /// Switches whether the app's own output is silenced while tapped, without restarting the tap.
+    pub fn set_mute_playback(&mut self, mute_playback: bool) -> Result<()> {
+        let mut desc = self.tap.desc().map_err(|e| anyhow!("tap description: {e:?}"))?;
+        desc.set_mute_behavior(if mute_playback { ca::TapMuteBehavior::MuttedWhenTapped } else { ca::TapMuteBehavior::Unmuted });
+        self.tap.set_desc(desc).map_err(|e| anyhow!("update tap: {e:?}"))?;
+        Ok(())
     }
 
     pub fn callbacks(&self) -> u64 {

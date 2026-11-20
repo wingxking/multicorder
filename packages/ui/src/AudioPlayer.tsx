@@ -3,7 +3,9 @@ import WaveSurfer from "wavesurfer.js";
 import Hover from "wavesurfer.js/dist/plugins/hover.esm.js";
 import Regions from "wavesurfer.js/dist/plugins/regions.esm.js";
 import Timeline from "wavesurfer.js/dist/plugins/timeline.esm.js";
-import { fmtTs, Icon, t, tError } from "@multicorder/ui";
+import { fmtTs } from "./api";
+import { Icon } from "./icons";
+import { t, tError } from "./i18n";
 
 export type Marker = { id: string; at_ms: number; label?: string | null };
 export type PlayerHandle = { toggle: () => void };

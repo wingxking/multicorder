@@ -78,8 +78,20 @@ enum Control {
         title: Option<String>,
     },
     Stop {
-        #[allow(dead_code)]
         reason: Option<String>,
+    },
+    /// One subtitle line from the page, timed by the browser's wall clock.
+    Caption {
+        wall_ms: f64,
+        dur_ms: f64,
+        text: String,
+        source: mc_core::CaptionSource,
+    },
+    /// Whether subtitles are playing right now (sent about once a second), and the text policy.
+    CaptionState {
+        active: bool,
+        source: Option<mc_core::CaptionSource>,
+        policy: Option<String>,
     },
 }
 
@@ -143,8 +155,14 @@ async fn run(state: ApiState, id: String, mut socket: WebSocket) {
                 Ok(Control::Navigation { url, title }) => {
                     let _ = engine.navigation(&id, url, title);
                 }
-                Ok(Control::Stop { .. }) => {
-                    let _ = engine.stop_session(&id, "user");
+                Ok(Control::Caption { wall_ms, dur_ms, text, source }) => {
+                    let _ = engine.caption(&id, wall_ms, dur_ms, &text, source);
+                }
+                Ok(Control::CaptionState { active, source, policy }) => {
+                    let _ = engine.caption_state(&id, active, source, policy.as_deref());
+                }
+                Ok(Control::Stop { reason }) => {
+                    let _ = if reason.as_deref() == Some(mc_engine::CANCELLED) { engine.cancel_session(&id) } else { engine.stop_session(&id, "user") };
                     break;
                 }
                 Err(_) => {}

@@ -378,3 +378,94 @@ async fn retry_transcribes_a_recording_that_never_had_text() {
 fn asr_is_on_by_default() {
     assert_eq!(SummaryMode::default(), SummaryMode::Live);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_recording_is_discarded() {
+    let (engine, dir) = engine();
+    let session = engine.start_session(
+        SourceSpec::ChromiumTab { tab_id: None, url: None, title: Some("Cancel test".into()), browser: None },
+        SummaryMode::Live,
+        None,
+    ).unwrap();
+    feed(&engine, &session.id, &tone(440.0, 2.0)).await;
+    let audio_dir = engine.session_dir(&session.id);
+    engine.cancel_session(&session.id).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.is_active(&session.id) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    assert!(engine.store.session(&session.id).unwrap().is_none());
+    assert!(engine.store.report(&session.id).unwrap().is_none());
+    assert!(!audio_dir.exists());
+    // Late transcription results for the deleted recording are dropped.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(engine.transcript(&session.id).unwrap().is_empty());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn caption_coverage_merges_and_measures() {
+    let mut c = crate::session::Coverage::default();
+    c.add(0, 2000);
+    c.add(1500, 3000);
+    c.add(5000, 6000);
+    c.add(2900, 4000);
+    assert!((c.share(0, 4000) - 1.0).abs() < 1e-9);
+    assert!((c.share(3000, 7000) - 0.5).abs() < 1e-9);
+    assert_eq!(c.share(7000, 8000), 0.0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn platform_subtitles_replace_asr_where_they_play() {
+    let (engine, dir) = engine();
+    let mut events = engine.subscribe();
+    let session = engine.start_session(
+        SourceSpec::ChromiumTab { tab_id: None, url: Some("https://www.youtube.com/watch?v=x".into()), title: Some("Captions".into()), browser: None },
+        SummaryMode::Live,
+        None,
+    ).unwrap();
+    let source = mc_core::CaptionSource { platform: "youtube".into(), kind: "creator".into(), lang: Some("en".into()), languages: vec!["en".into(), "zh-CN".into()] };
+    // Six seconds with subtitles playing (440 Hz would be "falcon" if it reached ASR)...
+    let sound = tone(440.0, 6.0);
+    let mut seq = 0u32;
+    for second in sound.chunks(16_000) {
+        engine.caption_state(&session.id, true, Some(source.clone()), Some("auto")).unwrap();
+        for frame in second.chunks(1600) {
+            engine.ingest_tab_frame(&session.id, seq, 0.0, frame).unwrap();
+            seq += 1;
+        }
+        tokio::task::yield_now().await;
+    }
+    engine.caption_state(&session.id, true, Some(source.clone()), Some("auto")).unwrap();
+    engine.caption(&session.id, 0.0, 1800.0, "hello from the subtitles", source.clone()).unwrap();
+    // ...then a stretch without subtitles (880 Hz → "zebra"), which goes to speech recognition.
+    engine.caption_state(&session.id, false, Some(source.clone()), Some("auto")).unwrap();
+    for frame in silence(1.5).iter().copied().chain(tone(880.0, 4.0)).chain(silence(1.5)).collect::<Vec<_>>().chunks(1600) {
+        engine.ingest_tab_frame(&session.id, seq, 0.0, frame).unwrap();
+        seq += 1;
+    }
+    engine.stop_session(&session.id, "user").unwrap();
+    assert!(engine.wait_finished(&session.id, Duration::from_secs(10)).await);
+    let text = engine.transcript(&session.id).unwrap();
+    let caption = text.iter().find(|e| e.text == "hello from the subtitles").expect("caption stored");
+    assert_eq!(caption.engine, "caption:youtube:creator:en");
+    assert!(text.iter().any(|e| e.text.contains("zebra")), "uncovered audio is transcribed: {text:?}");
+    assert!(!text.iter().any(|e| e.text.contains("falcon")), "covered audio skips ASR: {text:?}");
+    let mut announced = false;
+    while let Ok(event) = events.try_recv() {
+        if let mc_core::EngineEvent::TextSource { source: Some(s), active: true, .. } = event {
+            announced |= s.platform == "youtube";
+        }
+    }
+    assert!(announced);
+    // "Transcribe with ASR" replaces the subtitle text with speech recognition of all the audio.
+    assert!(engine.transcribe_with_asr(&session.id).unwrap() > 0);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !engine.transcript(&session.id).unwrap().iter().any(|e| e.text.contains("falcon")) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.unwrap();
+    assert!(engine.transcript(&session.id).unwrap().iter().all(|e| !e.engine.starts_with("caption:")));
+    std::fs::remove_dir_all(dir).ok();
+}

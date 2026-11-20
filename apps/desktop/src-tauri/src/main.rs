@@ -238,14 +238,52 @@ async fn start_app_session(s: State<'_, AppState>, app_id: String, mode: String,
         .map_err(err)
 }
 
+/// Tab recordings are captured by the Chrome extension: it owns pause, playback and stop for
+/// them, so those requests go to it (it forwards to this engine when it streams here).
+fn tab_control(s: &AppState, id: &str, action: &str, extra: Value) -> Option<Res<()>> {
+    s.browser_sources.recording(id)?;
+    Some(if s.browser_sources.control(id, action, extra) { Ok(()) } else { Err("The browser is not responding. Try again from Chrome.".into()) })
+}
+
 #[tauri::command]
 fn stop_session(s: State<AppState>, id: String) -> Res<()> {
+    if let Some(done) = tab_control(&s, &id, "stop", json!({})) {
+        return done;
+    }
     s.engine.stop_session(&id, "user").map_err(err)
+}
+
+/// Stops a recording and discards it (asked for confirmation in the UI first).
+#[tauri::command]
+fn cancel_session(s: State<AppState>, id: String) -> Res<()> {
+    if let Some(done) = tab_control(&s, &id, "cancel", json!({})) {
+        return done;
+    }
+    s.engine.cancel_session(&id).map_err(err)
 }
 
 #[tauri::command]
 fn pause_session(s: State<AppState>, id: String, paused: bool) -> Res<()> {
+    if let Some(done) = tab_control(&s, &id, if paused { "pause" } else { "resume" }, json!({})) {
+        return done;
+    }
     s.engine.set_paused(&id, paused).map_err(err)
+}
+
+/// "Record silently" while recording: silences the source on the speakers, or plays it again.
+#[tauri::command]
+fn set_session_muted(s: State<AppState>, id: String, muted: bool) -> Res<()> {
+    let action = if muted { "mute" } else { "unmute" };
+    if let Some(done) = tab_control(&s, &id, action, json!({})) {
+        return done;
+    }
+    // A tab recording always plays through the extension, even before Chrome reports its state.
+    if s.engine.store.session(&id).map_err(err)?.is_some_and(|row| row.kind == "chromium_tab") {
+        return if s.browser_sources.broadcast_control(&id, action) { Ok(()) } else {
+            Err("Chrome is not connected to Multicorder. Reload the Multicorder extension in Chrome and try again.".into())
+        };
+    }
+    s.engine.set_mute_playback(&id, muted).map_err(err)
 }
 
 #[tauri::command]
@@ -287,6 +325,15 @@ async fn generate_recording_transcript(s: State<'_, AppState>, id: String) -> Re
     retry_asr(s, id).await
 }
 
+/// Replaces a recording's text (platform subtitles) with speech recognition of its audio.
+#[tauri::command]
+fn transcribe_with_asr(s: State<AppState>, id: String) -> Res<usize> {
+    if !s.engine.status().asr_ready {
+        return Err("Configure a transcription API key in Settings first".into());
+    }
+    s.engine.transcribe_with_asr(&id).map_err(err)
+}
+
 #[tauri::command]
 async fn generate_recording_summary(s: State<'_, AppState>, id: String) -> Res<()> {
     s.engine.generate_summary(&id).await.map_err(err)
@@ -317,7 +364,10 @@ async fn export_recording_text(s: State<'_, AppState>, app: tauri::AppHandle, id
 #[tauri::command]
 fn set_mode(s: State<AppState>, id: String, mode: String) -> Res<()> {
     let m = SummaryMode::parse(&mode).ok_or("bad mode")?;
-    s.engine.set_mode(&id, m).map_err(err)
+    match s.browser_sources.recording(&id) {
+        Some(recording) if recording.backend == "local" => tab_control(&s, &id, "mode", json!({ "mode": m })).unwrap_or(Ok(())),
+        _ => s.engine.set_mode(&id, m).map_err(err),
+    }
 }
 
 #[tauri::command]
@@ -369,6 +419,15 @@ fn add_marker(s: State<AppState>, id: String) -> Res<String> {
 #[tauri::command]
 fn recording_markers(s: State<AppState>, id: String) -> Res<Value> {
     Ok(json!(s.engine.store.markers(&id).map_err(err)?))
+}
+
+/// Renames a recording; an empty name goes back to the source's title.
+#[tauri::command]
+fn rename_session(s: State<AppState>, id: String, name: Option<String>) -> Res<()> {
+    if s.browser_sources.recording(&id).is_some_and(|r| r.backend == "local") {
+        return tab_control(&s, &id, "rename", json!({ "name": name })).unwrap_or(Ok(()));
+    }
+    s.engine.store.set_name(&id, name.as_deref()).map_err(err)
 }
 
 #[tauri::command]
@@ -445,8 +504,8 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            status, ai_settings, save_ai_settings, list_apps, list_browser_sources, open_browser_source, app_icon, list_microphones, list_sessions, start_app_session, start_mic_session, stop_session, pause_session, set_mode, transcript, insights, report, missed, export, add_marker, recording_markers, delete_session, retry_asr, export_audio,
-            load_recording_audio, load_paused_audio, export_recording_selection, recording_preview, generate_recording_transcript, generate_recording_summary, copy_recording_text, export_recording_text
+            status, ai_settings, save_ai_settings, list_apps, list_browser_sources, open_browser_source, app_icon, list_microphones, list_sessions, start_app_session, start_mic_session, stop_session, cancel_session, pause_session, set_session_muted, set_mode, transcript, insights, report, missed, export, add_marker, recording_markers, rename_session, delete_session, retry_asr, export_audio,
+            load_recording_audio, load_paused_audio, export_recording_selection, recording_preview, generate_recording_transcript, transcribe_with_asr, generate_recording_summary, copy_recording_text, export_recording_text
         ])
         .run(tauri::generate_context!())
         .expect("error while running Multicorder");

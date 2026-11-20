@@ -1,9 +1,10 @@
 // Library of in-browser recordings: list with search on the left, detail on the right (key points
 // with evidence that jump into the audio, transcript, report), exports, retry and audio download.
 
+import { devReloadPage } from "./dev-reload";
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { applyTheme, Icon, LangToggle, locale, t, tError, THEME_CSS, ThemeToggle, useLang } from "@multicorder/ui";
+import { applyTheme, captionFromEngine, captionLabel, Icon, LangToggle, locale, t, tError, THEME_CSS, ThemeToggle, useConfirm, useLang } from "@multicorder/ui";
 import * as db from "./local/db";
 import { fmtTs, Insight, Seg } from "./local/insight";
 
@@ -33,7 +34,7 @@ function statusChip(s: db.LocalSession) {
   return <span className="chip">{s.failure === "no_audio" ? t("No audio") : t("Done")}</span>;
 }
 
-function Detail({ s, onChanged }: { s: db.LocalSession; onChanged: () => void }) {
+function Detail({ s, onChanged, onDelete, onAsr }: { s: db.LocalSession; onChanged: () => void; onDelete: (s: db.LocalSession) => void; onAsr: (s: db.LocalSession) => Promise<void> }) {
   const [segs, setSegs] = useState<Seg[]>([]);
   const [ins, setIns] = useState<Insight[]>([]);
   const [report, setReport] = useState<db.LocalReport | undefined>();
@@ -61,6 +62,7 @@ function Detail({ s, onChanged }: { s: db.LocalSession; onChanged: () => void })
       if (url) URL.revokeObjectURL(url);
     };
   }, [s.id]);
+  const caption = captionFromEngine(segs.find((e) => e.engine?.startsWith("caption:"))?.engine);
   const md = useMemo(() => (report?.body ?? `# ${s.title}\n\n`) + "\n---\n\n## Transcript\n\n" + segs.map((e) => `\`[${fmtTs(e.startMs)}]\` ${e.text}`).join("\n\n"), [report, segs, s.title]);
   const jump = (ms: number, id: string) => {
     setFocus(id);
@@ -99,9 +101,12 @@ function Detail({ s, onChanged }: { s: db.LocalSession; onChanged: () => void })
         <button className="btn" onClick={() => download(`multicorder-${s.id}.srt`, toSrt(segs), "application/x-subrip")}><Icon name="download" size={13} />SRT</button>
         <button className="btn" onClick={() => download(`multicorder-${s.id}.json`, JSON.stringify({ session: s, transcript: segs, insights: ins, report }, null, 2), "application/json")}><Icon name="download" size={13} />JSON</button>
         {audioUrl && <a className="btn" href={audioUrl} download={`multicorder-${s.id}.webm`}><Icon name="download" size={13} />{t("Audio")}</a>}
-        {!missing && s.status === "stopped" && s.failure !== "no_audio" && <button className="btn" disabled={busy} onClick={() => void retry()}><Icon name="retry" size={13} />{t("Transcribe again")}</button>}
+        {caption && <span className="source-tag" title={t("This recording's text comes from the platform's subtitles, not speech recognition.")}><Icon name="captions" size={12} />{captionLabel(caption)}</span>}
+        {!missing && s.status === "stopped" && s.failure !== "no_audio" && (caption
+          ? <button className="btn" disabled={busy} onClick={() => { setBusy(true); void onAsr(s).finally(() => { setBusy(false); load(); }); }}><Icon name="mic" size={13} />{t("Transcribe with speech recognition")}</button>
+          : <button className="btn" disabled={busy} onClick={() => void retry()}><Icon name="retry" size={13} />{t("Transcribe again")}</button>)}
         <span className="grow" />
-        <button className="btn btn-ghost btn-danger" onClick={() => { if (confirm(t("Delete this recording, its transcript and summary?"))) db.deleteSession(s.id).then(onChanged).catch((e) => setMsg(tError(e))); }}><Icon name="trash" size={13} />{t("Delete")}</button>
+        <button className="btn btn-ghost btn-danger" onClick={() => onDelete(s)}><Icon name="trash" size={13} />{t("Delete")}</button>
       </div>
       <div className="cols">
         <section className="panel-block">
@@ -147,9 +152,46 @@ function App() {
     return () => chrome.runtime.onMessage.removeListener(onMsg);
   }, []);
   const current = list.find((s) => s.id === sel) ?? list[0];
+  const [confirmDialog, confirm] = useConfirm();
+  const [notice, setNotice] = useState<string | null>(null);
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(null), 2500);
+    return () => clearTimeout(timer);
+  }, [notice]);
+  const remove = async (s: db.LocalSession) => {
+    const ok = await confirm({
+      title: t("Delete this recording?"),
+      message: t("“{name}” and its audio, transcript and summary will be deleted. This can't be undone.", { name: s.name?.trim() || s.title }),
+      confirmLabel: t("Delete"),
+    });
+    if (!ok) return;
+    try {
+      await db.deleteSession(s.id);
+      setNotice(t("Recording deleted."));
+      if (sel === s.id) { setSel(null); history.replaceState(null, "", location.pathname); }
+      await load();
+    } catch (error) {
+      setNotice(tError(error));
+    }
+  };
+  const asrInstead = async (s: db.LocalSession) => {
+    const ok = await confirm({
+      title: t("Transcribe with speech recognition?"),
+      message: t("The platform subtitles, key points and summary of this recording are replaced by speech recognition of its audio. This uses your transcription service."),
+      confirmLabel: t("Transcribe"),
+      danger: false,
+    });
+    if (!ok) return;
+    const r = await chrome.runtime.sendMessage({ type: "local-asr", sessionId: s.id }).catch((e) => ({ error: tError(e) }));
+    setNotice(r?.error ? tError(r.error) : t("Transcribing {n} part(s)…", { n: r?.queued ?? 0 }));
+    await load();
+  };
   return (
     <div className="lib">
       <style>{THEME_CSS + LIB_CSS}</style>
+      {confirmDialog}
+      {notice && <div className="toast" role="status">{notice}</div>}
       <aside>
         <header className="ahead"><span className="logo" aria-hidden><Icon name="wave" /></span><h1>{t("Library")}</h1><span className="grow" /><a className="btn btn-ghost icon-btn" href="options.html" title={t("Settings")} aria-label={t("Settings")}><Icon name="gear" /></a><LangToggle /><ThemeToggle persist={(p) => chrome.storage.local.set({ theme: p })} /></header>
         <form className="search" onSubmit={(e) => { e.preventDefault(); if (q.trim()) db.search(q).then(setHits); else setHits(null); }}>
@@ -171,13 +213,14 @@ function App() {
                   <span className="t">{s.title}</span>
                   <span className="meta small muted">{new Date(s.started_at).toLocaleDateString(locale())} · {fmtTs(s.audio_ms)} {s.asr?.failed_chunks ? <span className="chip warn">{t("Text missing")}</span> : null}</span>
                 </button>
+                {!["capturing", "starting", "waiting", "stopping", "paused"].includes(s.status) && <button className="list-delete" aria-label={t("Delete {name}", { name: s.name?.trim() || s.title })} title={t("Delete")} onClick={() => void remove(s)}><Icon name="trash" size={13} /></button>}
               </li>
             ))}
           </ul>
         )}
         {list.length === 0 && <div className="empty list-empty"><Icon name="wave" size={24} /><span>{t("No recordings yet.")}</span></div>}
       </aside>
-      <main>{current ? <Detail key={current.id} s={current} onChanged={() => void load()} /> : <div className="empty main-empty"><Icon name="library" size={28} /><span>{t("Select a recording.")}</span></div>}</main>
+      <main>{current ? <Detail key={current.id} s={current} onChanged={() => void load()} onDelete={(s) => void remove(s)} onAsr={asrInstead} /> : <div className="empty main-empty"><Icon name="library" size={28} /><span>{t("Select a recording.")}</span></div>}</main>
     </div>
   );
 }
@@ -193,6 +236,12 @@ aside{border-right:1px solid var(--border);background:var(--sidebar);display:fle
 .list button:hover{background:var(--surface-3)}
 .list button[aria-current="true"]{background:var(--surface);box-shadow:var(--shadow)}
 .list button:focus-visible{outline:2px solid var(--focus)}
+.list li{position:relative}
+.list li>button:first-child{padding-right:34px}
+.list .list-delete{all:unset;position:absolute;right:8px;top:50%;transform:translateY(-50%);width:24px;height:24px;display:grid;place-items:center;border-radius:5px;color:var(--text-3);cursor:pointer;opacity:0;transition:opacity .12s}
+.list li:hover .list-delete,.list .list-delete:focus-visible{opacity:1}
+.list .list-delete:hover{background:var(--accent-weak);color:var(--accent-text)}
+.list .list-delete:focus-visible{outline:2px solid var(--focus)}
 .list .t{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .list .meta{display:flex;gap:6px;align-items:center}
 .list-empty{margin:12px}
@@ -214,4 +263,5 @@ audio{width:100%;height:40px}
 @media (max-width:820px){.lib{grid-template-columns:1fr;height:auto;min-height:100vh}.cols{grid-template-columns:1fr}aside{max-height:40vh}.detail{padding:16px}}
 `;
 
+devReloadPage();
 createRoot(document.getElementById("root")!).render(<App />);

@@ -62,11 +62,19 @@ button,select,input,textarea{font:inherit;color:inherit}
 .btn:active:not(:disabled){transform:translateY(.5px)}
 .btn:disabled{opacity:.5;cursor:default}
 .btn svg{flex:none}
-.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff;box-shadow:0 1px 2px rgba(229,72,77,.3)}
-.btn-primary:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+.btn-primary{background:var(--primary);border-color:var(--primary);color:#fff;box-shadow:0 1px 2px color-mix(in srgb,var(--primary) 30%,transparent)}
+.btn-primary:hover{background:color-mix(in srgb,var(--primary) 88%,#000);border-color:color-mix(in srgb,var(--primary) 88%,#000)}
 .btn-sm{height:26px;padding:0 8px;font-size:12px}
-.btn-audible{background:var(--ok-weak);border-color:color-mix(in srgb,var(--ok) 30%,transparent);color:var(--ok-text)}
-.btn-audible:hover{background:var(--ok-weak);border-color:var(--ok)}
+/* Recording status colours, shared by the Mac app and the extension:
+   green = ready to record (audio detected) · neutral = can record, no audio yet · red = recording (REC light)
+   amber = paused or reconnecting · blue = waiting, saving, processing · grey = done or idle. */
+.btn-record{color:var(--text-2)}
+.btn-record svg{color:var(--text-3)}
+.btn-record svg circle{fill:none;stroke:currentColor;stroke-width:1.6}
+.btn-record.is-ready{background:var(--ok-weak);border-color:color-mix(in srgb,var(--ok) 35%,transparent);color:var(--ok-text)}
+.btn-record.is-ready svg{color:var(--ok)}
+.btn-record.is-ready svg circle{fill:currentColor;stroke:none}
+.btn-record.is-ready:hover{background:color-mix(in srgb,var(--ok) 16%,var(--surface));border-color:var(--ok)}
 .audio-dot{width:7px;height:7px;flex:none;border-radius:50%;background:var(--border-strong)}
 .audio-dot.on{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 20%,transparent)}
 .audio-idle{color:var(--text-2)}
@@ -78,6 +86,8 @@ button,select,input,textarea{font:inherit;color:inherit}
 .btn-sm.icon-btn{width:26px}
 .text-btn{min-width:30px;padding:0 6px;font-size:12px;font-weight:600}
 .input,select.input{height:30px;padding:0 9px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);min-width:0;transition:border-color .12s,box-shadow .12s}
+select.input{-webkit-appearance:none;appearance:none;padding-right:30px;background-image:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 16 16' fill='none' stroke='%238d8d98' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E\");background-repeat:no-repeat;background-position:right 10px center;background-size:12px;cursor:pointer}
+select.input:disabled{cursor:default}
 .input:hover{border-color:var(--border-strong)}
 .input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--focus)}
 .seg{display:inline-flex;gap:2px;padding:2px;border-radius:var(--radius-sm);background:var(--surface-3)}
@@ -87,6 +97,19 @@ button,select,input,textarea{font:inherit;color:inherit}
 .seg button:disabled{cursor:default;opacity:.6}
 .chip{display:inline-flex;align-items:center;gap:5px;height:22px;padding:0 8px;border-radius:999px;font-size:11px;font-weight:500;background:var(--surface-2);color:var(--text-2);white-space:nowrap;border:1px solid transparent}
 .chip.rec{background:var(--accent-weak);color:var(--accent-text)}
+.chip.err{background:var(--accent-weak);color:var(--accent-text)}
+.text-source{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.text-source.is-captions{color:var(--ok-text)}
+.text-source svg{flex:none}
+.source-tag{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--ok-text);background:var(--ok-weak);border-radius:999px;padding:1px 8px;white-space:nowrap}
+.mc-confirm{width:min(380px,calc(100% - 32px));padding:0;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);color:var(--text);box-shadow:var(--shadow-lg)}
+.mc-confirm::backdrop{background:rgb(0 0 0 / 35%);backdrop-filter:blur(2px)}
+.mc-confirm-body{display:grid;gap:8px;padding:20px}
+.mc-confirm h2{margin:0;font-size:15px;font-weight:600}
+.mc-confirm p{margin:0;font-size:13px;color:var(--text-2);line-height:1.5}
+.mc-confirm-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:10px}
+.btn-destructive{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn-destructive:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
 .chip.ok{background:var(--ok-weak);color:var(--ok-text)}
 .chip.warn{background:var(--warn-weak);color:var(--warn-text)}
 .chip.info{background:var(--info-weak);color:var(--info-text)}

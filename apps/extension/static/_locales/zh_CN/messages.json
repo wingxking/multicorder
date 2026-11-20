@@ -13,5 +13,8 @@
   },
   "menuRecord": {
     "message": "用 Multicorder 录制此标签页"
+  },
+  "actionArmed": {
+    "message": "点击录制此标签页"
   }
 }

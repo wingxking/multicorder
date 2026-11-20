@@ -36,11 +36,15 @@ export type OffscreenMsg =
   | ({ target: "offscreen"; type: "start-element"; audioUrl: string } & StartCommon)
   | { target: "offscreen"; type: "stop"; sessionId?: string; tabId?: number; reason: string }
   | { target: "offscreen"; type: "mark"; tabId: number; mark: MediaMark }
+  | { target: "offscreen"; type: "caption"; tabId: number; msg: import("./captions/core").CaptionMsg; policy: "auto" | "captions" }
   | { target: "offscreen"; type: "navigation"; tabId: number; url?: string; title?: string }
   | { target: "offscreen"; type: "mute"; sessionId: string; muted: boolean }
+  | { target: "offscreen"; type: "pause"; sessionId: string; paused: boolean }
+  | { target: "offscreen"; type: "mode"; sessionId: string; mode: "off" | "live" | "after" }
   | { target: "offscreen"; type: "local-mode"; sessionId: string; mode: "off" | "live" | "after" }
   | { target: "offscreen"; type: "local-missed"; sessionId: string; minutes: number }
   | { target: "offscreen"; type: "local-retry"; sessionId: string }
+  | { target: "offscreen"; type: "local-asr"; sessionId: string }
   | { target: "offscreen"; type: "local-flush"; sessionId: string }
   | { target: "offscreen"; type: "local-retry-all" }
   | { target: "offscreen"; type: "list" };
@@ -56,7 +60,7 @@ export interface OffscreenSession {
   muted: boolean;
 }
 
-export const WHITELIST = [/(^|\.)youtube\.com$/, /^youtu\.be$/, /(^|\.)bilibili\.com$/, /(^|\.)vimeo\.com$/, /(^|\.)twitch\.tv$/, /(^|\.)x\.com$/, /(^|\.)linkedin\.com$/];
+export const WHITELIST = [/(^|\.)youtube\.com$/, /^youtu\.be$/, /(^|\.)bilibili\.com$/, /(^|\.)vimeo\.com$/, /(^|\.)twitch\.tv$/, /(^|\.)x\.com$/, /(^|\.)linkedin\.com$/, /(^|\.)tiktok\.com$/, /(^|\.)douyin\.com$/, /(^|\.)xiaohongshu\.com$/];
 
 export function isWhitelisted(url?: string): boolean {
   if (!url) return false;
@@ -66,4 +70,22 @@ export function isWhitelisted(url?: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Live state of one tab recording, sent by the offscreen document a few times a second
+ *  (`{type:"capture-state"}`) to the side panel and, through the worker, to the Mac app. */
+export interface CaptureState {
+  tab_id: number;
+  session_id: string;
+  backend: "app" | "local";
+  status: "waiting" | "capturing" | "paused";
+  paused: boolean;
+  muted: boolean;
+  mode: "off" | "live" | "after";
+  title: string;
+  started_at: string;
+  elapsed_ms: number;
+  level_db: number;
+  /** Waveform peaks (0–1, 40 per second) since the previous report. */
+  peaks: number[];
 }

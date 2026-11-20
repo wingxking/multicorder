@@ -2,6 +2,9 @@
   "name": "multicorder",
   "private": true,
   "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:app": "pnpm --filter @multicorder/desktop tauri dev",
+    "dev:ext": "pnpm --filter @multicorder/extension dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "e2e": "bash scripts/e2e/run.sh all"

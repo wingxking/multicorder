@@ -25,6 +25,9 @@ use session::{SessionHandle, SessionMsg};
 /// Clamps how many sessions may capture at once (design: MAX_APP_TAPS = 8, tabs similar).
 pub const MAX_ACTIVE_SESSIONS: usize = 16;
 
+/// Stop reason for a recording the user cancelled: it is discarded instead of saved.
+pub const CANCELLED: &str = "cancelled";
+
 pub struct Engine {
     pub store: Arc<Store>,
     pub data_dir: PathBuf,
@@ -162,7 +165,7 @@ impl Engine {
         self.events.subscribe()
     }
 
-    pub(crate) fn emit(&self, e: EngineEvent) {
+    pub fn emit(&self, e: EngineEvent) {
         let _ = self.events.send(e);
     }
 
@@ -384,6 +387,59 @@ impl Engine {
         Ok(())
     }
 
+    /// A subtitle line the platform showed (wall-clock time from the browser). Stored as transcript
+    /// text in place of speech recognition for that stretch.
+    pub fn caption(&self, id: &str, wall_ms: f64, dur_ms: f64, text: &str, source: mc_core::CaptionSource) -> anyhow::Result<()> {
+        let h = self.handle(id)?;
+        if h.waiting_for_audio() || h.paused() || h.capture_closed() || text.trim().is_empty() {
+            return Ok(());
+        }
+        let at_ms = h.session_ms_at_wall(wall_ms);
+        let msg = SessionMsg::Caption { at_ms, dur_ms: dur_ms.max(1.0) as i64, text: text.trim().chars().take(2000).collect(), source };
+        h.tx.try_send(msg).map_err(|e| anyhow::anyhow!("session busy: {e}"))
+    }
+
+    /// Whether subtitles are playing now; covered stretches skip speech recognition.
+    pub fn caption_state(&self, id: &str, active: bool, source: Option<mc_core::CaptionSource>, policy: Option<&str>) -> anyhow::Result<()> {
+        let h = self.handle(id)?;
+        if h.waiting_for_audio() || h.capture_closed() {
+            return Ok(());
+        }
+        let at_ms = h.session_ms();
+        let policy = match policy {
+            Some("captions") => session::TextPolicy::CaptionsOnly,
+            _ => session::TextPolicy::Auto,
+        };
+        h.tx.try_send(SessionMsg::CaptionState { at_ms, active: active && !h.paused(), source, policy }).map_err(|e| anyhow::anyhow!("session busy: {e}"))
+    }
+
+    /// Replaces a finished recording's text (platform subtitles or earlier results) with speech
+    /// recognition of the whole recording. Returns the number of ranges queued.
+    pub fn transcribe_with_asr(self: &Arc<Self>, id: &str) -> anyhow::Result<usize> {
+        if self.is_active(id) {
+            anyhow::bail!("End the recording before transcribing it again");
+        }
+        let session = self.store.session(id)?.ok_or_else(|| anyhow::anyhow!("no session {id}"))?;
+        let segs = retry::segments_of(self, id);
+        let end = segs.last().map(|s| s.end_ms).unwrap_or(0);
+        if end == 0 {
+            anyhow::bail!("This recording has no audio");
+        }
+        let audio = mc_recorder::read_range(&segs, 0, end)?;
+        self.store.clear_transcript(id)?;
+        let pass = if session.summary_mode == "after" { "after" } else { "backfill" };
+        let mut n = 0;
+        for c in mc_vad::chunk_all(&audio, 0) {
+            self.store.add_asr_failure(id, c.start_ms, c.end_ms, pass, "queued by transcribe with ASR")?;
+            n += 1;
+        }
+        self.emit(EngineEvent::Status { session_id: id.to_string(), status: session.status, detail: Some("transcript_reset".into()) });
+        if n > 0 {
+            retry::run_pass(self);
+        }
+        Ok(n)
+    }
+
     pub fn navigation(&self, id: &str, url: Option<String>, title: Option<String>) -> anyhow::Result<()> {
         if let Some(t) = title.filter(|t| !t.is_empty()) {
             self.store.set_title(id, &t)?;
@@ -410,6 +466,11 @@ impl Engine {
 
     pub fn set_paused(&self, id: &str, paused: bool) -> anyhow::Result<()> {
         self.handle(id)?.set_paused(paused)
+    }
+
+    /// Silences (or plays again) an app being recorded, without interrupting the recording.
+    pub fn set_mute_playback(&self, id: &str, mute_playback: bool) -> anyhow::Result<()> {
+        self.handle(id)?.set_mute_playback(mute_playback)
     }
 
     /// Stops capture; transcription and the report continue in the background.
@@ -450,10 +511,22 @@ impl Engine {
         export::export(self, id, format)
     }
 
+    /// Stops a recording and throws it away: no transcription, report or saved audio is kept.
+    pub fn cancel_session(&self, id: &str) -> anyhow::Result<()> {
+        let h = self.handle(id)?;
+        h.tx.try_send(SessionMsg::Stop { reason: CANCELLED.into() }).map_err(|e| anyhow::anyhow!("session busy: {e}"))?;
+        Ok(())
+    }
+
     pub fn delete_session(&self, id: &str) -> anyhow::Result<()> {
         if self.is_active(id) {
             anyhow::bail!("stop the session before deleting it");
         }
+        self.remove_session_data(id)
+    }
+
+    /// Deletes a session's rows and its audio folder.
+    pub(crate) fn remove_session_data(&self, id: &str) -> anyhow::Result<()> {
         self.store.delete_session(id)?;
         let dir = self.session_dir(id);
         if dir.starts_with(self.data_dir.join("audio")) {
@@ -482,6 +555,9 @@ impl Engine {
                 let (n, ms) = summary.get(&row.id).copied().unwrap_or((0, 0));
                 let mut v = serde_json::to_value(&row).unwrap_or_default();
                 v["asr"] = serde_json::to_value(AsrHealth::from_counts(n, ms)).unwrap_or_default();
+                if let Some(muted) = self.handle(&row.id).ok().and_then(|h| h.mute_playback()) {
+                    v["muted"] = muted.into();
+                }
                 v
             })
             .collect())

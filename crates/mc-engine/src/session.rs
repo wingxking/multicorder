@@ -17,6 +17,8 @@ use crate::Engine;
 /// Tab frames are 100 ms (1600 samples).
 pub const TAB_FRAME_SAMPLES: usize = 1600;
 /// Longest silence inserted for a seq gap before the frame is treated as a new stream position.
+/// `transcript_events.pass` for platform subtitle text.
+pub(crate) const CAPTIONS_PASS: &str = "captions";
 const MAX_GAP_FILL_FRAMES: u32 = 600;
 const AUDIO_START_DB: f32 = -55.0;
 
@@ -28,6 +30,62 @@ pub enum SessionMsg {
     Gap { start_ms: i64, end_ms: i64, cause: String },
     Status(String, Option<String>),
     Stop { reason: String },
+    /// A platform subtitle line at session time `at_ms`.
+    Caption { at_ms: i64, dur_ms: i64, text: String, source: mc_core::CaptionSource },
+    /// Subtitles playing (`active`) at session time `at_ms`.
+    CaptionState { at_ms: i64, active: bool, source: Option<mc_core::CaptionSource>, policy: TextPolicy },
+}
+
+/// What happens to speech recognition while platform subtitles are available (extension setting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextPolicy {
+    /// Subtitles where the video has them, speech recognition for everything else.
+    Auto,
+    /// Subtitles only: speech recognition never runs for this recording.
+    CaptionsOnly,
+}
+
+/// A chunk counts as covered by subtitles when they were playing for this share of it.
+const CAPTION_COVERAGE: f64 = 0.8;
+/// Each "subtitles playing" heartbeat (about once a second) covers this much session time around it.
+const CAPTION_HEARTBEAT_BEFORE_MS: i64 = 1500;
+const CAPTION_HEARTBEAT_AFTER_MS: i64 = 500;
+
+/// Session-time ranges during which platform subtitles were playing (merged, sorted).
+#[derive(Debug, Default)]
+pub(crate) struct Coverage(Vec<(i64, i64)>);
+
+impl Coverage {
+    pub(crate) fn add(&mut self, start: i64, end: i64) {
+        if end <= start {
+            return;
+        }
+        if let Some(last) = self.0.last_mut() {
+            if start <= last.1 && start >= last.0 {
+                last.1 = last.1.max(end);
+                return;
+            }
+        }
+        self.0.push((start, end));
+        self.0.sort_unstable();
+        let mut merged: Vec<(i64, i64)> = Vec::with_capacity(self.0.len());
+        for (s, e) in self.0.drain(..) {
+            match merged.last_mut() {
+                Some(m) if s <= m.1 => m.1 = m.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        self.0 = merged;
+    }
+
+    /// Share of `[start, end)` that is covered.
+    pub(crate) fn share(&self, start: i64, end: i64) -> f64 {
+        if end <= start {
+            return 0.0;
+        }
+        let covered: i64 = self.0.iter().map(|&(s, e)| (e.min(end) - s.max(start)).max(0)).sum();
+        covered as f64 / (end - start) as f64
+    }
 }
 
 #[allow(dead_code)]
@@ -72,6 +130,25 @@ impl SessionHandle {
 
     pub fn paused(&self) -> bool {
         self.input.lock().unwrap().paused
+    }
+
+    /// Whether an app recording is silenced on the speakers (`None` for other sources).
+    pub fn mute_playback(&self) -> Option<bool> {
+        #[cfg(target_os = "macos")]
+        if let Some(capture) = self.capture.lock().unwrap().as_ref() {
+            return Some(capture.mute_playback());
+        }
+        None
+    }
+
+    pub fn set_mute_playback(&self, mute_playback: bool) -> anyhow::Result<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(capture) = self.capture.lock().unwrap().as_ref() {
+            capture.set_mute_playback(mute_playback);
+            return Ok(());
+        }
+        let _ = mute_playback;
+        anyhow::bail!("This source has no playback to mute")
     }
 
     pub fn capture_closed(&self) -> bool {
@@ -345,6 +422,10 @@ struct SessionTask {
     peaks: Vec<f32>,
     peak: f32,
     peak_samples: usize,
+    caption_source: Option<mc_core::CaptionSource>,
+    caption_active: bool,
+    caption_policy: TextPolicy,
+    coverage: Coverage,
 }
 
 impl SessionTask {
@@ -372,6 +453,10 @@ impl SessionTask {
             peaks: Vec::new(),
             peak: 0.0,
             peak_samples: 0,
+            caption_source: None,
+            caption_active: false,
+            caption_policy: TextPolicy::Auto,
+            coverage: Coverage::default(),
         };
         if mode == SummaryMode::Live {
             t.start_live(false);
@@ -403,6 +488,8 @@ impl SessionTask {
                         let status = if self.paused || self.awaiting_audio() { self.status().into() } else { status };
                         self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status, detail });
                     }
+                    Some(SessionMsg::Caption { at_ms, dur_ms, text, source }) => self.on_caption(at_ms, dur_ms, text, source),
+                    Some(SessionMsg::CaptionState { at_ms, active, source, policy }) => self.on_caption_state(at_ms, active, source, policy),
                     Some(SessionMsg::Stop { reason }) => { stop_reason = reason; break; }
                     None => break,
                 },
@@ -558,8 +645,62 @@ impl SessionTask {
         self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status: self.status().into(), detail: Some(format!("mode: {}", mode.as_str())) });
     }
 
+    fn on_caption_state(&mut self, at_ms: i64, active: bool, source: Option<mc_core::CaptionSource>, policy: TextPolicy) {
+        self.caption_policy = policy;
+        if active && source.is_some() {
+            self.coverage.add(at_ms - CAPTION_HEARTBEAT_BEFORE_MS, at_ms + CAPTION_HEARTBEAT_AFTER_MS);
+        }
+        let active = active && source.is_some();
+        if source != self.caption_source || active != self.caption_active {
+            self.caption_source = source.clone();
+            self.caption_active = active;
+            self.engine.emit(EngineEvent::TextSource { session_id: self.id.clone(), source, active });
+        }
+    }
+
+    /// Stores a platform subtitle line as transcript text (no speech recognition cost).
+    fn on_caption(&mut self, at_ms: i64, dur_ms: i64, text: String, source: mc_core::CaptionSource) {
+        if self.paused || self.awaiting_audio() || self.mode == SummaryMode::Off {
+            return;
+        }
+        let start = at_ms.clamp(0, samples_to_ms(self.total_samples).max(0) + 2000);
+        let e = TranscriptEvent {
+            id: new_id(),
+            session_id: self.id.clone(),
+            start_ms: start,
+            end_ms: start + dur_ms.max(1),
+            media_start_ms: self.engine.store.media_time_at(&self.id, start).ok().flatten(),
+            revision: 1,
+            state: "final".into(),
+            supersedes: None,
+            text,
+            lang: source.lang.clone(),
+            engine: source.engine_id(),
+        };
+        if let Err(err) = self.engine.store.insert_transcript(&e, CAPTIONS_PASS) {
+            tracing::warn!(error = %err, "caption insert failed");
+            return;
+        }
+        self.engine.emit(EngineEvent::Transcript { session_id: self.id.clone(), event: e.clone() });
+        if let Some(tx) = &self.insight_tx {
+            let _ = tx.send(vec![e]);
+        }
+    }
+
+    /// Speech recognition is skipped where platform subtitles already give the text.
+    fn covered_by_captions(&self, chunk: &SpeechChunk) -> bool {
+        if self.caption_policy == TextPolicy::CaptionsOnly && self.caption_source.is_some() {
+            return true;
+        }
+        self.coverage.share(chunk.start_ms, chunk.end_ms) >= CAPTION_COVERAGE
+    }
+
     /// Queues one speech chunk; the result is stored and forwarded to the insight loop.
     fn submit(&self, chunk: SpeechChunk, pass: Pass, correct: bool) {
+        if self.covered_by_captions(&chunk) {
+            tracing::debug!(session = %self.id, start = chunk.start_ms, "chunk covered by platform subtitles; no ASR");
+            return;
+        }
         let rx = self.engine.scheduler().submit(&self.id, pass, chunk.start_ms, chunk.samples.clone(), None);
         let engine = self.engine.clone();
         let id = self.id.clone();
@@ -604,6 +745,9 @@ impl SessionTask {
                 self.on_audio(s);
             }
         }
+        if reason == crate::CANCELLED {
+            return self.discard().await;
+        }
         if reason == "user" && self.awaiting_audio() {
             reason = "no_audio".into();
         }
@@ -636,6 +780,11 @@ impl SessionTask {
                 let audio = mc_recorder::read_range(&segs, 0, end).unwrap_or_default();
                 if self.insight_tx.is_none() {
                     let (tx, rx) = mpsc::unbounded_channel();
+                    // Subtitle text stored during the recording feeds the key points too.
+                    let captions: Vec<TranscriptEvent> = self.engine.store.transcript(&self.id).unwrap_or_default().into_iter().filter(|e| e.engine.starts_with("caption:")).collect();
+                    if !captions.is_empty() {
+                        let _ = tx.send(captions);
+                    }
                     self.insight_tx = Some(tx);
                     self.insight_task = Some(tokio::spawn(insight_loop(self.engine.clone(), self.id.clone(), rx)));
                 }
@@ -675,9 +824,33 @@ impl SessionTask {
     }
 }
 
+impl SessionTask {
+    /// Ends a cancelled recording: closes the audio file, stops the summary, then deletes everything.
+    async fn discard(mut self) {
+        let _ = self.engine.store.set_status(&self.id, "stopping", Some(crate::CANCELLED));
+        self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status: "stopping".into(), detail: Some(crate::CANCELLED.into()) });
+        if let Some(r) = self.recorder.take() {
+            let _ = tokio::task::spawn_blocking(move || r.finish()).await;
+        }
+        self.chunker = None;
+        self.insight_tx = None;
+        if let Some(task) = self.insight_task.take() {
+            task.abort();
+        }
+        if let Err(e) = self.engine.remove_session_data(&self.id) {
+            tracing::warn!(session = %self.id, error = %e, "could not delete a cancelled recording");
+        }
+        self.engine.emit(EngineEvent::Status { session_id: self.id.clone(), status: "stopped".into(), detail: Some(crate::CANCELLED.into()) });
+    }
+}
+
 /// Stores the segments of one transcribed chunk as transcript events and emits them.
 /// `correct` replaces live text over the same range (after-mode pass over a live session).
 pub(crate) fn store_segments(engine: &Arc<Engine>, id: &str, chunk_start: i64, chunk_end: i64, segments: Vec<mc_asr::AsrSegment>, pass: Pass, correct: bool) -> Vec<TranscriptEvent> {
+    // A chunk still in flight when its recording was cancelled and deleted.
+    if engine.store.session(id).ok().flatten().is_none() {
+        return Vec::new();
+    }
     let adapter = engine.scheduler().adapter();
     let minutes = (chunk_end - chunk_start) as f64 / 60_000.0;
     let _ = engine.store.add_usage(Some(id), &adapter.id(), "minutes", minutes, adapter.usd_per_minute() * minutes);
@@ -711,6 +884,9 @@ pub(crate) fn store_segments(engine: &Arc<Engine>, id: &str, chunk_start: i64, c
 
 /// A failed chunk is kept for retry; recording is never affected (design: ASR is best-effort).
 pub(crate) fn record_asr_failure(engine: &Arc<Engine>, id: &str, start_ms: i64, end_ms: i64, pass: Pass, err: &anyhow::Error) {
+    if engine.store.session(id).ok().flatten().is_none() {
+        return;
+    }
     tracing::warn!(session = %id, error = %err, "transcription failed; will retry");
     let msg = err.to_string();
     let _ = engine.store.add_asr_failure(id, start_ms, end_ms, pass.as_str(), &msg);

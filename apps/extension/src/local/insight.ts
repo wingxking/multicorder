@@ -162,7 +162,7 @@ export function applyOps(sessionId: string, out: any, segs: Map<string, Seg>, cu
 
 // ---- report ----
 export function reportSystem(lang: string): string {
-  return `Write the final report for ONE audio source in ${langName(lang)}. Return only JSON: {"summary":"2-3 sentences","sections":[{"heading":"...","bullets":[{"text":"...","evidence":["<segment id>"]}]}]}. Use 3-6 sections such as key points, numbers and announcements, decisions, open questions, action items. Every bullet cites segment ids from the input; copy numbers exactly as in the cited segments; do not invent facts.`;
+  return `Write the final report for ONE audio source in ${langName(lang)}. Return only JSON: {"title":"a short, specific name for this recording (at most 8 words, no quotes or date)","summary":"2-3 sentences","sections":[{"heading":"...","bullets":[{"text":"...","evidence":["<segment id>"]}]}]}. Use 3-6 sections such as key points, numbers and announcements, decisions, open questions, action items. Every bullet cites segment ids from the input; copy numbers exactly as in the cited segments; do not invent facts.`;
 }
 
 export function reportInput(title: string, segs: Seg[], points: Insight[]): string {

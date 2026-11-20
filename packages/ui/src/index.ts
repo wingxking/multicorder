@@ -5,3 +5,6 @@ export * from "./icons";
 export * from "./i18n";
 export * from "./ThemeToggle";
 export * from "./title";
+export * from "./recorder";
+export * from "./confirm";
+export * from "./text-source";

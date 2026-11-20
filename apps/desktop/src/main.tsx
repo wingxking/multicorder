@@ -6,10 +6,10 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ACTIVE_SESSION_STATUSES as ACTIVE, CARD_CSS, EngineEvent, fmtTs, Icon, Insight, LangToggle, locale, PreferenceControls, PREFS_CSS, programTitle, Session, SummaryMode, t, tError, THEME_CSS, ThemeToggle, TranscriptEvent, useLang, useToast, WAITING_FOR_AUDIO } from "@multicorder/ui";
+import { ACTIVE_SESSION_STATUSES as ACTIVE, CARD_CSS, RECORDER_CSS, EngineEvent, fmtTs, Icon, Insight, LangToggle, locale, PreferenceControls, PREFS_CSS, programTitle, Session, SummaryMode, t, tError, THEME_CSS, ThemeToggle, TranscriptEvent, captionFromEngine, captionLabel, useConfirm, useLang, useToast, WAITING_FOR_AUDIO } from "@multicorder/ui";
 import { mockEngineEvents, mockInvoke } from "./mock";
 import { AI_SETTINGS_CSS, AiSettings, ServiceDevOptions } from "./AiSettings";
-import { AppIcon, DEFAULT_RECORDING_FORMAT, DownloadMenu, LIVE_PEAK_WINDOW, LiveCard, RECORDING_CSS, RecordingFormat, RecordingPanel, SavedClip } from "./RecordingPanel";
+import { AppIcon, DEFAULT_RECORDING_FORMAT, DownloadMenu, LIVE_PEAK_WINDOW, LiveCard, RECORDING_CSS, RecordingFormat, RecordingPanel, recordingName, SavedClip, sourceTitle } from "./RecordingPanel";
 
 const inApp = "__TAURI_INTERNALS__" in window;
 const invoke = <T,>(cmd: string, args?: Record<string, unknown>): Promise<T> => (inApp ? tauriInvoke<T>(cmd, args) : mockInvoke<T>(cmd, args));
@@ -34,6 +34,32 @@ interface BrowserSource {
   audible: boolean;
   ordinal: number;
   standalone_recording: boolean;
+  /** Live state of the tab's recording, reported by the extension that captures it. */
+  recording?: TabRecording | null;
+}
+
+interface TabRecording {
+  tab_id: number;
+  session_id: string;
+  /** "local": processed in Chrome (no engine session here); "app": streamed to this app. */
+  backend: "local" | "app";
+  status: string;
+  paused: boolean;
+  muted: boolean;
+  mode?: SummaryMode | null;
+  title: string;
+  started_at: string;
+  elapsed_ms: number;
+}
+
+/** A Chrome-processed recording shown with this app's recorder controls (routed to Chrome). */
+function remoteSession(browser: BrowserSource): Session | undefined {
+  const r = browser.recording;
+  if (!r || r.backend !== "local") return undefined;
+  return {
+    id: r.session_id, kind: "chromium_tab", title: r.title || browser.title, app_bundle_id: browser.bundle_id, capture_source_id: browser.source_id,
+    status: r.paused ? "paused" : r.status, summary_mode: r.mode ?? "live", started_at: r.started_at || new Date().toISOString(), audio_ms: r.elapsed_ms, muted: r.muted,
+  };
 }
 
 interface Microphone {
@@ -110,6 +136,9 @@ function phaseText(phase: string) {
   return phase === "capturing" ? t("Recording") : phase === "paused" ? t("Paused") : phase === "waiting" ? t("Waiting") : phase === "stopping" ? t("Saving") : t("Connecting");
 }
 
+/** Chip colour for a session phase: red while recording, amber when paused, blue while in progress. */
+const phaseChip = (phase: string) => (phase === "capturing" ? "rec" : phase === "paused" || phase === "reconnecting" ? "warn" : "info");
+
 function Live({ activeOnly, selected, setSelected, sessions, cards, remarks, saveRemark, refresh, flash }: {
   activeOnly: boolean;
   selected: string | null;
@@ -138,6 +167,10 @@ function Live({ activeOnly, selected, setSelected, sessions, cards, remarks, sav
   const [starting, setStarting] = useState<string[]>([]);
   const [remarkEdit, setRemarkEdit] = useState<{ key: string; name: string; value: string } | null>(null);
   const [remarkError, setRemarkError] = useState(false);
+  // Asked when the user ends a recording here: what to call it (prefilled with the source's name).
+  const [naming, setNaming] = useState<{ id: string; fallback: string; value: string } | null>(null);
+  const nameDialog = useRef<HTMLDialogElement>(null);
+  const nameInput = useRef<HTMLInputElement>(null);
   const remarkDialog = useRef<HTMLDialogElement>(null);
   const remarkInput = useRef<HTMLInputElement>(null);
   const live = useRef<HTMLDivElement>(null);
@@ -219,7 +252,7 @@ function Live({ activeOnly, selected, setSelected, sessions, cards, remarks, sav
     }
     sources.get(key)!.sessions.push(session);
   }
-  const activeSession = (source: Source) => source.sessions.find((session) => ACTIVE.includes(session.status));
+  const activeSession = (source: Source) => source.sessions.find((session) => ACTIVE.includes(session.status)) ?? (source.browser ? remoteSession(source.browser) : undefined);
   const isAudible = (item: Source) => {
     if (item.app?.is_emitting || item.browser?.audible) return true;
     const session = activeSession(item);
@@ -307,9 +340,9 @@ function Live({ activeOnly, selected, setSelected, sessions, cards, remarks, sav
           {!remark && item.browser?.site && item.browser.title && <div className="source-original-name" title={item.browser.app}>{item.browser.site}</div>}
         </div>
         {item.mic?.is_default && !activeOnly && <span className="chip default">{t("Default")}</span>}
-        {phase ? <span className={`chip ${phase === "capturing" ? "rec" : "info"}`}>{phase === "capturing" && <span className="dot" />}{phaseText(phase)}</span>
-          : item.browser?.standalone_recording ? <span className="chip rec">{t("Recording in browser")}</span>
-          : canStart && <button className={`btn btn-sm rec-btn ${audible ? "btn-audible" : ""}`} disabled={starting.includes(item.key)} aria-label={`${label} ${name}`} title={audible ? undefined : t(WAITING_FOR_AUDIO)} onClick={() => void start(item)}><Icon name="record" size={13} />{label}</button>}
+        {phase ? <span className={`chip ${phaseChip(phase)}`}>{phase === "capturing" && <span className="dot" />}{phaseText(phase)}</span>
+          : item.browser?.standalone_recording ? <span className="chip rec"><span className="dot" />{t("Recording in Chrome")}</span>
+          : canStart && <button className={`btn btn-sm btn-record${audible ? " is-ready" : ""}`} disabled={starting.includes(item.key)} aria-label={`${label} ${name}`} title={audible ? undefined : t(WAITING_FOR_AUDIO)} onClick={() => void start(item)}><Icon name="record" size={13} />{label}</button>}
       </li>
     );
   }
@@ -377,7 +410,9 @@ function Live({ activeOnly, selected, setSelected, sessions, cards, remarks, sav
       />
       <section className="board" key={source?.key ?? "empty"}>
         {source ? <RecordingPanel key={source.key} title={remarks[source.key] || source.name} iconPath={source.iconPath}
-          mutePlayback={mutePlayback} setMutePlayback={source.mic ? undefined : changeMutePlayback} originalName={remarks[source.key] ? source.name : undefined} kind={source.kind}
+          mutePlayback={mutePlayback} setMutePlayback={source.mic ? undefined : changeMutePlayback}
+          sessionMuted={current ? source.browser?.recording?.session_id === current.id ? source.browser.recording.muted : current.muted : undefined}
+          remote={!!current && !!source.browser && remoteSession(source.browser)?.id === current.id} originalName={remarks[source.key] ? source.name : undefined} kind={source.kind}
           session={current} card={current ? cards[current.id] : undefined} cards={cards}
           clips={(source.app ? sessions.filter((session) => sourceKey(session) === source.key ||
             (session.kind === "chromium_tab" && session.app_bundle_id === source.app?.app_id)) : source.sessions).filter(isSaved)}
@@ -390,9 +425,40 @@ function Live({ activeOnly, selected, setSelected, sessions, cards, remarks, sav
             await invoke("stop_session", { id });
             setSelected(source.key);
             setEndedSource(source.key);
+            const ended = sessions.find((session) => session.id === id);
+            const fallback = ended ? recordingName(ended) : remarks[source.key] || source.name;
+            setNaming({ id, fallback, value: fallback });
+            nameDialog.current?.showModal();
+            requestAnimationFrame(() => nameInput.current?.select());
           }} invoke={invoke} flash={flash} refresh={refresh} />
           : <div className="empty board-empty"><Icon name={activeOnly ? "live" : "speaker"} size={28} /><strong>{activeOnly ? t("Nothing is recording") : t("Pick an audio source")}</strong><span className="small">{activeOnly ? t("Start a source from All sources.") : t("Select an audio source to open its recording panel.")}</span></div>}
       </section>
+      <dialog className="source-remark-dialog" ref={nameDialog} aria-labelledby="recording-name-title" onClose={() => setNaming(null)}>
+        <form onSubmit={async (event) => {
+          event.preventDefault();
+          const edit = naming;
+          nameDialog.current?.close();
+          const name = edit?.value.trim();
+          if (!edit || !name || name === edit.fallback) return;
+          try {
+            await invoke("rename_session", { id: edit.id, name });
+            refresh();
+          } catch (failure) {
+            flash(tError(failure));
+          }
+        }}>
+          <h2 id="recording-name-title">{t("Name this recording")}</h2>
+          <label>{t("Name")}
+            <input className="input" ref={nameInput} value={naming?.value ?? ""} placeholder={naming?.fallback} aria-describedby="recording-name-hint"
+              onChange={(event) => { if (naming) setNaming({ ...naming, value: event.target.value }); }} />
+          </label>
+          <p className="source-original-name" id="recording-name-hint">{t("Keep the suggested name to let AI name it after the summary. You can rename it later from any list.")}</p>
+          <div className="source-remark-actions">
+            <button className="btn" type="button" onClick={() => nameDialog.current?.close()}>{t("Skip")}</button>
+            <button className="btn btn-primary" type="submit">{t("Save")}</button>
+          </div>
+        </form>
+      </dialog>
       <dialog className="source-remark-dialog" ref={remarkDialog} aria-labelledby="source-remark-title">
         <form onSubmit={(event) => {
           event.preventDefault();
@@ -457,8 +523,14 @@ function Detail({ session, refresh, flash }: { session: Row; refresh: () => void
       refresh();
     }
   };
+  const [confirmDialog, confirm] = useConfirm();
   const remove = async () => {
-    if (!confirm(t("Delete this recording, its transcript and summary?"))) return;
+    const ok = await confirm({
+      title: t("Delete this recording?"),
+      message: t("“{name}” and its audio, transcript and summary will be deleted. This can't be undone.", { name: recordingName(session) }),
+      confirmLabel: t("Delete"),
+    });
+    if (!ok) return;
     try {
       await invoke("delete_session", { id: session.id });
       refresh();
@@ -466,7 +538,27 @@ function Detail({ session, refresh, flash }: { session: Row; refresh: () => void
       flash(tError(e));
     }
   };
-  const title = session.kind === "chromium_tab" ? programTitle(session.title) : session.title;
+  const title = recordingName(session);
+  const caption = captionFromEngine(lines.find((l) => l.engine?.startsWith("caption:"))?.engine);
+  const asrInstead = async () => {
+    const ok = await confirm({
+      title: t("Transcribe with speech recognition?"),
+      message: t("The platform subtitles, key points and summary of this recording are replaced by speech recognition of its audio. This uses your transcription service."),
+      confirmLabel: t("Transcribe"),
+      danger: false,
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      const n = await invoke<number>("transcribe_with_asr", { id: session.id });
+      flash(t("Transcribing {n} part(s)…", { n }));
+    } catch (e) {
+      flash(tError(e));
+    } finally {
+      setBusy(false);
+      refresh();
+    }
+  };
   const save = async (format: string) => {
     try {
       const path = format === "wav"
@@ -483,10 +575,11 @@ function Detail({ session, refresh, flash }: { session: Row; refresh: () => void
   };
   return (
     <article className="detail">
+      {confirmDialog}
       <header className="dhead">
         <div>
           <h2>{title}</h2>
-          <p className="small muted">{t(KIND[session.kind] ?? session.kind)} · {fmtTs(session.audio_ms)} · {new Date(session.started_at).toLocaleString(locale())}</p>
+          <p className="small muted">{t(KIND[session.kind] ?? session.kind)}{session.name?.trim() ? ` · ${sourceTitle(session)}` : ""} · {fmtTs(session.audio_ms)} · {new Date(session.started_at).toLocaleString(locale())}</p>
         </div>
         {waiting ? <span className="chip info">{t("Waiting for audio")}</span> : active ? <span className="chip rec"><span className="dot" />{t("Recording")}</span> : missing ? <span className="chip warn">{t("Text missing")}</span> : <span className="chip">{empty ? t("No audio") : t("Done")}</span>}
       </header>
@@ -502,7 +595,10 @@ function Detail({ session, refresh, flash }: { session: Row; refresh: () => void
           { key: "json", label: "JSON" },
           ...(!waiting && !empty ? [{ key: "wav", label: t("Audio (WAV)") }] : []),
         ]} onPick={(format) => void save(format)} />
-        {!missing && !active && !empty && <button className="btn btn-sm" disabled={busy} onClick={() => void retry()}><Icon name="retry" size={13} />{t("Transcribe again")}</button>}
+        {caption && <span className="source-tag" title={t("This recording's text comes from the platform's subtitles, not speech recognition.")}><Icon name="captions" size={12} />{captionLabel(caption)}</span>}
+        {!missing && !active && !empty && (caption
+          ? <button className="btn btn-sm" disabled={busy} onClick={() => void asrInstead()}><Icon name="mic" size={13} />{t("Transcribe with speech recognition")}</button>
+          : <button className="btn btn-sm" disabled={busy} onClick={() => void retry()}><Icon name="retry" size={13} />{t("Transcribe again")}</button>)}
         <span className="grow" />
         {!active && <button className="btn btn-sm btn-ghost btn-danger" onClick={() => void remove()}><Icon name="trash" size={13} />{t("Delete")}</button>}
       </div>
@@ -531,14 +627,81 @@ function Detail({ session, refresh, flash }: { session: Row; refresh: () => void
   );
 }
 
+type TimeRange = "all" | "today" | "week" | "month";
+type SortOrder = "newest" | "oldest" | "longest" | "shortest" | "name";
+const HISTORY_VIEW_KEY = "mc-history-view";
+const TIME_RANGES: TimeRange[] = ["all", "today", "week", "month"];
+const SORT_ORDERS: SortOrder[] = ["newest", "oldest", "longest", "shortest", "name"];
+
+/** Since when a time filter keeps recordings (ms since epoch); 0 keeps everything. */
+function rangeStart(range: TimeRange) {
+  const day = new Date();
+  day.setHours(0, 0, 0, 0);
+  if (range === "today") return day.getTime();
+  if (range === "week") return day.getTime() - 6 * 86400000;
+  if (range === "month") return day.getTime() - 29 * 86400000;
+  return 0;
+}
+
 function History({ sessions, cards, refresh, flash }: { sessions: Row[]; cards: Cards; refresh: () => void; flash: (text: string) => void }) {
   const [detail, setDetail] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [visible, setVisible] = useState(12);
+  const [apps, setApps] = useState<AppInfo[]>([]);
+  const [view, setView] = useState(() => {
+    const saved = readJson<{ app?: unknown; range?: unknown; sort?: unknown }>(HISTORY_VIEW_KEY, {});
+    return {
+      app: typeof saved.app === "string" ? saved.app : "",
+      range: TIME_RANGES.includes(saved.range as TimeRange) ? saved.range as TimeRange : "all",
+      sort: SORT_ORDERS.includes(saved.sort as SortOrder) ? saved.sort as SortOrder : "newest",
+    };
+  });
+  const change = (next: Partial<typeof view>) => {
+    const value = { ...view, ...next };
+    setView(value);
+    setVisible(12);
+    store(HISTORY_VIEW_KEY, JSON.stringify(value));
+  };
+  useEffect(() => { void invoke<AppInfo[]>("list_apps").then((items) => setApps(items ?? [])).catch(() => {}); }, []);
+  const appFor = (bundle?: string | null) => bundle ? apps.find((app) => app.app_id.toLowerCase() === bundle.toLowerCase()) : undefined;
+  const browserFor = (row: Row) => appFor(row.app_bundle_id ?? "com.google.chrome");
+  const iconFor = (row: Row) => row.kind === "mic" ? null : (row.kind === "chromium_tab" ? browserFor(row) : appFor(row.app_bundle_id))?.bundle_path;
+  /** The app filter groups recordings by app: each Mac app, each browser's tabs, each microphone. */
+  const appOf = (row: Row): { key: string; label: string } => row.kind === "chromium_tab"
+    ? { key: `tab:${(row.app_bundle_id ?? "com.google.chrome").toLowerCase()}`, label: t("{browser} tabs", { browser: browserFor(row)?.name ?? "Chrome" }) }
+    : row.kind === "mic" ? { key: `mic:${row.title}`, label: row.title }
+    : { key: `app:${(row.app_bundle_id ?? row.title).toLowerCase()}`, label: appFor(row.app_bundle_id)?.name ?? row.title };
+
   const query = search.trim().toLowerCase();
   const saved = useMemo(() => sessions.filter(isSaved), [sessions]);
-  const shown = useMemo(() => saved.filter((row) => !query || row.title.toLowerCase().includes(query)), [saved, query]);
+  const appOptions = useMemo(() => {
+    const options = new Map<string, { label: string; count: number }>();
+    for (const row of saved) {
+      const { key, label } = appOf(row);
+      options.set(key, { label, count: (options.get(key)?.count ?? 0) + 1 });
+    }
+    return [...options].sort((a, b) => a[1].label.localeCompare(b[1].label, locale()));
+  }, [saved, apps]);
+  const app = appOptions.some(([key]) => key === view.app) ? view.app : "";
+  const shown = useMemo(() => {
+    const since = rangeStart(view.range);
+    const rows = saved.filter((row) => (!app || appOf(row).key === app)
+      && (!since || Date.parse(row.started_at) >= since)
+      && (!query || [recordingName(row), row.title, appOf(row).label].some((text) => text.toLowerCase().includes(query))));
+    const time = (row: Row) => Date.parse(row.started_at);
+    const compare: Record<SortOrder, (a: Row, b: Row) => number> = {
+      newest: (a, b) => time(b) - time(a),
+      oldest: (a, b) => time(a) - time(b),
+      longest: (a, b) => b.audio_ms - a.audio_ms,
+      shortest: (a, b) => a.audio_ms - b.audio_ms,
+      name: (a, b) => recordingName(a).localeCompare(recordingName(b), locale(), { numeric: true }),
+    };
+    return rows.sort(compare[view.sort]);
+  }, [saved, app, view.range, view.sort, query, apps]);
+  const filtered = !!(query || app || view.range !== "all");
   const current = saved.find((row) => row.id === detail);
+  const rangeLabel: Record<TimeRange, string> = { all: t("All time"), today: t("Today"), week: t("Last 7 days"), month: t("Last 30 days") };
+  const sortLabel: Record<SortOrder, string> = { newest: t("Newest first"), oldest: t("Oldest first"), longest: t("Longest first"), shortest: t("Shortest first"), name: t("Name (A–Z)") };
   return (
     <div className="history">
       {current ? <>
@@ -546,12 +709,28 @@ function History({ sessions, cards, refresh, flash }: { sessions: Row[]; cards: 
         <Detail key={current.id} session={current} refresh={refresh} flash={flash} />
       </> : <div className="history-inner">
         <div className="pane-title history-head">
-          <h2>{t("History")}{saved.length > 0 && <span className="count">{saved.length}</span>}</h2>
-          <div className="history-filter"><Icon name="search" /><input className="input" placeholder={t("Filter by audio source")} aria-label={t("Filter by audio source")} value={search} onChange={(e) => { setSearch(e.target.value); setVisible(12); }} /></div>
+          <h2>{t("History")}{saved.length > 0 && <span className="count">{filtered ? `${shown.length} / ${saved.length}` : saved.length}</span>}</h2>
+          <div className="history-filter"><Icon name="search" /><input className="input" placeholder={t("Search recordings")} aria-label={t("Search recordings")} value={search} onChange={(e) => { setSearch(e.target.value); setVisible(12); }} /></div>
         </div>
+        {saved.length > 0 && <div className="history-tools">
+          <select className="input input-sm" aria-label={t("Filter by app")} value={app} onChange={(e) => change({ app: e.target.value })}>
+            <option value="">{t("All apps")}</option>
+            {appOptions.map(([key, { label, count }]) => <option key={key} value={key}>{label} ({count})</option>)}
+          </select>
+          <select className="input input-sm" aria-label={t("Filter by time")} value={view.range} onChange={(e) => change({ range: e.target.value as TimeRange })}>
+            {TIME_RANGES.map((range) => <option key={range} value={range}>{rangeLabel[range]}</option>)}
+          </select>
+          <span className="grow" />
+          <label className="history-sort"><span>{t("Sort")}</span>
+            <select className="input input-sm" value={view.sort} onChange={(e) => change({ sort: e.target.value as SortOrder })}>
+              {SORT_ORDERS.map((sort) => <option key={sort} value={sort}>{sortLabel[sort]}</option>)}
+            </select>
+          </label>
+          {filtered && <button className="btn btn-sm btn-ghost" onClick={() => { setSearch(""); change({ app: "", range: "all" }); }}>{t("Clear filters")}</button>}
+        </div>}
         {shown.length ? <ul className="history-clips">{shown.slice(0, visible).map((row) => (
-          <SavedClip key={row.id} clip={{ ...row, title: row.kind === "chromium_tab" ? programTitle(row.title) : row.title }} revision={cards[row.id]?.textRevision} invoke={invoke} flash={flash} showSource onDetails={() => setDetail(row.id)} />
-        ))}</ul> : <div className="empty"><Icon name="history" size={28} /><span>{query ? t("No matching recordings.") : t("Finished recordings will appear here.")}</span></div>}
+          <SavedClip key={row.id} clip={row} iconPath={iconFor(row)} revision={cards[row.id]?.textRevision} invoke={invoke} flash={flash} showSource onDetails={() => setDetail(row.id)} onRenamed={refresh} onDeleted={refresh} />
+        ))}</ul> : <div className="empty"><Icon name="history" size={28} /><span>{filtered ? t("No matching recordings.") : t("Finished recordings will appear here.")}</span></div>}
         {shown.length > visible && <button className="btn" onClick={() => setVisible((count) => count + 12)}>{t("Show more recordings")}</button>}
       </div>}
     </div>
@@ -689,6 +868,7 @@ function App() {
         if (e.type === "transcript" || e.type === "report") n.textRevision = (c.textRevision ?? 0) + 1;
         if (e.type === "insight") n.insights = [...c.insights.filter((i) => i.key !== e.insight.key), e.insight].filter((i) => i.state !== "retracted");
         if (e.type === "backlog") n.backlog = e.pending_chunks;
+        if (e.type === "text_source") n.textSource = { source: e.source, active: e.active };
         return { ...prev, [e.session_id]: n };
       });
     };
@@ -738,7 +918,7 @@ function App() {
   const health = status ? (!status.asr_ready ? t("No transcription key") : degraded ? t("Transcription degraded") : t("Services ready")) : null;
   return (
     <div className={`app${sidebar.compact ? " sidebar-compact" : ""}${sidebar.dragging ? " is-resizing" : ""}`} style={{ gridTemplateColumns: `${sidebar.width}px minmax(0, 1fr)` }}>
-      <style>{THEME_CSS + PREFS_CSS + CARD_CSS + APP_CSS + RECORDING_CSS + AI_SETTINGS_CSS}</style>
+      <style>{THEME_CSS + PREFS_CSS + CARD_CSS + APP_CSS + RECORDER_CSS + RECORDING_CSS + AI_SETTINGS_CSS}</style>
       <aside className="sidebar">
         <div className="brand"><span className="logo" aria-hidden><Icon name="wave" /></span><strong className="nav-text">Multicorder</strong></div>
         <nav className="nav" aria-label="Recording views">
@@ -823,7 +1003,6 @@ main{min-width:0;min-height:0;overflow:hidden}
 .source-row-primary{display:flex;align-items:center;gap:2px}
 .source-row-name{min-width:0;background:none;border:0;padding:0;text-align:left;cursor:pointer;color:inherit;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
 .source-row-name::after{content:"";position:absolute;inset:0}
-.rec-btn:not(.btn-audible) svg{color:var(--accent)}
 .source-row .btn,.source-row .chip,.source-remark-edit{position:relative;z-index:1}
 .source-row-name[aria-current="true"]{color:var(--text)}
 .source-row-name:focus-visible{outline:2px solid var(--focus);border-radius:3px}
@@ -847,6 +1026,10 @@ main{min-width:0;min-height:0;overflow:hidden}
 .history-filter{display:flex;align-items:center;gap:8px;color:var(--text-3);position:relative}
 .history-filter svg{position:absolute;left:9px;pointer-events:none}
 .history-filter .input{padding-left:30px;width:260px;max-width:100%}
+.history-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.history-tools .grow{flex:1}
+.history-tools select{width:auto;max-width:220px}
+.history-sort{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-3)}
 .history-clips{list-style:none;margin:0;padding:0;display:grid;gap:10px}
 .history-clips>.saved-clip{box-shadow:var(--shadow);padding:14px}
 .back{align-self:flex-start;margin:0 0 4px -6px}

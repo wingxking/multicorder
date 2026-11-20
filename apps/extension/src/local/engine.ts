@@ -11,6 +11,7 @@ import { chatJson, ServiceError, Target, targetLabel, transcribe } from "./provi
 import { FairQueue, Pass } from "./queue";
 import type { Settings, SummaryMode } from "./settings";
 import { AUDIO_START_DB } from "../protocol";
+import { CAPTION_COVERAGE, CaptionMsg, CaptionSource, captionEngineId, Coverage } from "../captions/core";
 
 export type LocalEvent =
   | { type: "status"; session_id: string; status: string; detail?: string | null }
@@ -19,7 +20,8 @@ export type LocalEvent =
   | { type: "insight"; session_id: string; insight: Insight }
   | { type: "report"; session_id: string; is_final: boolean }
   | { type: "backlog"; session_id: string; pending_chunks: number }
-  | { type: "asr"; session_id: string; asr: NonNullable<db.LocalSession["asr"]> };
+  | { type: "asr"; session_id: string; asr: NonNullable<db.LocalSession["asr"]> }
+  | { type: "text_source"; session_id: string; source: CaptionSource | null; active: boolean };
 
 export type Resolver = () => Promise<{ target: Target; settings: Settings }>;
 
@@ -31,6 +33,14 @@ const toSeg = (s: Seg) => ({ id: s.id, session_id: s.sessionId, start_ms: s.star
 const short = (e: unknown) => String((e as Error)?.message ?? e).slice(0, 160);
 
 class Archive {
+  pause() {
+    if (this.recorder.state === "recording") this.recorder.pause();
+  }
+
+  resume() {
+    if (this.recorder.state === "paused") this.recorder.resume();
+  }
+
   private writer: Promise<FileSystemWritableFileStream>;
   private chain: Promise<unknown> = Promise.resolve();
   private recorder: MediaRecorder;
@@ -106,9 +116,16 @@ class Session {
   lastReduce = Date.now();
   levelAcc: number[] = [];
   stopping = false;
+  paused = false;
   archive: Archive | null;
   started: Promise<void> = Promise.resolve();
   preRoll: Float32Array | null = null;
+  /** Wall clock of the last audio frame, to place subtitle lines on the recording's timeline. */
+  lastPushWall = 0;
+  captionSource: CaptionSource | null = null;
+  captionActive = false;
+  captionsOnly = false;
+  coverage = new Coverage();
 
   constructor(public row: db.LocalSession, public stream: MediaStream, public settings: Settings) {
     this.archive = row.status === "waiting" ? null : new Archive(row.id, stream);
@@ -169,7 +186,7 @@ export class LocalEngine {
   /** 100 ms of 16 kHz PCM16 from the worklet. */
   push(id: string, pcm: Int16Array, rmsDb: number) {
     const s = this.sessions.get(id);
-    if (!s || s.stopping) return;
+    if (!s || s.stopping || s.paused) return;
     const f = new Float32Array(pcm.length);
     for (let i = 0; i < pcm.length; i++) f[i] = pcm[i] / 32768;
     if (!s.archive) {
@@ -187,6 +204,7 @@ export class LocalEngine {
       s.preRoll = null;
     }
     s.total += f.length;
+    s.lastPushWall = Date.now();
     for (const v of f) s.levelAcc.push(v);
     if (s.levelAcc.length >= SAMPLE_RATE) {
       const rms = Math.sqrt(s.levelAcc.reduce((a, v) => a + v * v, 0) / s.levelAcc.length);
@@ -234,7 +252,44 @@ export class LocalEngine {
     return asr;
   }
 
+  /** Platform subtitles from the page: lines become transcript text, playing time skips ASR. */
+  caption(id: string, msg: CaptionMsg, policy: "auto" | "captions") {
+    const s = this.sessions.get(id);
+    if (!s || s.stopping || s.paused || !s.archive) return;
+    const nowMs = samplesToMs(s.total);
+    if (msg.kind === "state") {
+      s.captionsOnly = policy === "captions";
+      const active = msg.active && !!msg.source;
+      if (active) s.coverage.beat(nowMs);
+      if (JSON.stringify(msg.source) !== JSON.stringify(s.captionSource) || active !== s.captionActive) {
+        s.captionSource = msg.source;
+        s.captionActive = active;
+        emit({ type: "text_source", session_id: id, source: msg.source, active });
+      }
+      return;
+    }
+    if (s.row.summary_mode === "off") return;
+    const start = Math.max(0, Math.min(nowMs + 2000, nowMs - (s.lastPushWall - msg.wall_ms)));
+    const seg: Seg = { id: newId(), sessionId: id, startMs: Math.round(start), endMs: Math.round(start + Math.max(1, msg.dur_ms)), text: msg.text, state: "final", engine: captionEngineId(msg.source) };
+    void s.started.then(() => this.storeSegs(id, [seg]));
+    s.insightBuf.push(seg);
+  }
+
+  private coveredByCaptions(s: Session, chunk: SpeechChunk) {
+    return (s.captionsOnly && !!s.captionSource) || s.coverage.share(chunk.startMs, chunk.endMs) >= CAPTION_COVERAGE;
+  }
+
+  /** Replaces a finished recording's text (platform subtitles) with speech recognition of its audio. */
+  async transcribeWithAsr(id: string) {
+    if (this.sessions.has(id)) throw new Error("End the recording before transcribing it again");
+    await db.clearText(id);
+    await db.patchSession(id, { report_pending: false });
+    emit({ type: "status", session_id: id, status: "stopped", detail: "transcript_reset" });
+    return this.retry(id);
+  }
+
   private submit(sessionId: string, s: Session, chunk: SpeechChunk, pass: Pass, correct: boolean) {
+    if (this.coveredByCaptions(s, chunk)) return;
     s.pending++;
     this.queue
       .submit(sessionId, pass, async () => {
@@ -297,6 +352,20 @@ export class LocalEngine {
     }
   }
 
+  /** Pauses or resumes a recording: nothing is recorded or transcribed while paused. */
+  async setPaused(id: string, paused: boolean) {
+    const s = this.sessions.get(id);
+    if (!s || s.stopping || s.paused === paused) return;
+    s.paused = paused;
+    if (paused) s.archive?.pause();
+    else s.archive?.resume();
+    if (!s.archive) return; // still waiting for audio: nothing recorded yet
+    s.row.status = paused ? "paused" : "capturing";
+    await s.started;
+    await db.patchSession(id, { status: s.row.status });
+    emit({ type: "status", session_id: id, status: s.row.status });
+  }
+
   async setMode(id: string, mode: SummaryMode) {
     const s = this.sessions.get(id);
     if (!s || s.row.summary_mode === mode) return;
@@ -329,12 +398,21 @@ export class LocalEngine {
     await s.started;
     if (!s.archive) {
       releaseInput();
-      await db.patchSession(id, { status: "stopped", ended_at: new Date().toISOString(), failure: "no_audio" });
+      if (reason === "cancelled") await db.deleteSession(id).catch(console.error);
+      else await db.patchSession(id, { status: "stopped", ended_at: new Date().toISOString(), failure: "no_audio" });
       this.sessions.delete(id);
       emit({ type: "status", session_id: id, status: "stopped", detail: "no_audio" });
       return;
     }
     emit({ type: "status", session_id: id, status: "stopping", detail: reason });
+    if (reason === "cancelled") {
+      // The user discarded this recording: close the file, then delete it with its text.
+      await s.archive.stop().catch(() => {}).finally(releaseInput);
+      this.sessions.delete(id);
+      await db.deleteSession(id).catch(console.error);
+      emit({ type: "status", session_id: id, status: "stopped", detail: reason });
+      return;
+    }
     if (drainMs) await new Promise((resolve) => setTimeout(resolve, drainMs));
     await s.archive.stop().finally(releaseInput);
     const audioMs = samplesToMs(s.total);
@@ -374,6 +452,9 @@ export class LocalEngine {
       const points = await db.insights(id);
       const { out } = await chatJson(target, reportSystem(settings.outputLang), reportInput(title, segs, points), 4000);
       const r = renderReport(title, out, new Map(segs.map((e) => [e.id, e])));
+      const name = typeof out?.title === "string" ? out.title.trim().replace(/^["“「]|["”」]$/g, "").slice(0, 80) : "";
+      const row = await db.getSession(id);
+      if (name && row && (!row.name || row.name_auto)) await db.patchSession(id, { name, name_auto: true });
       await db.putReport({ sessionId: id, body: r.body, sections: r.sections, created_at: new Date().toISOString() });
       emit({ type: "report", session_id: id, is_final: true });
       return true;

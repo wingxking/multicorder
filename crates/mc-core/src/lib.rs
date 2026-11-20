@@ -200,6 +200,28 @@ pub enum EngineEvent {
     Gap { session_id: String, start_ms: i64, end_ms: i64, cause: String },
     Report { session_id: String, is_final: bool },
     Backlog { session_id: String, pending_chunks: usize },
+    /// Where the recording's text currently comes from: the platform's subtitles (`active`) or
+    /// speech recognition (`source` is `None`, or subtitles are known but not playing right now).
+    TextSource { session_id: String, source: Option<CaptionSource>, active: bool },
+}
+
+/// Subtitles a video platform serves for what is being recorded (sent by the browser extension).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CaptionSource {
+    /// youtube | bilibili | tiktok | douyin | web
+    pub platform: String,
+    /// creator (uploaded by the author) | auto (the platform's speech recognition) | live (broadcast captions)
+    pub kind: String,
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub languages: Vec<String>,
+}
+
+impl CaptionSource {
+    /// Engine id stored on transcript events, e.g. `caption:youtube:creator:en`.
+    pub fn engine_id(&self) -> String {
+        format!("caption:{}:{}:{}", self.platform, self.kind, self.lang.as_deref().unwrap_or("und"))
+    }
 }
 
 impl EngineEvent {
@@ -212,7 +234,8 @@ impl EngineEvent {
             | EngineEvent::Insight { session_id, .. }
             | EngineEvent::Gap { session_id, .. }
             | EngineEvent::Report { session_id, .. }
-            | EngineEvent::Backlog { session_id, .. } => session_id,
+            | EngineEvent::Backlog { session_id, .. }
+            | EngineEvent::TextSource { session_id, .. } => session_id,
         }
     }
 }

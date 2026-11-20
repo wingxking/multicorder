@@ -4,6 +4,7 @@
 import { browserClientId, clearDesktopIntent, desktopIntent, DesktopPairing, recordingLabel, startDesktopSourceSync } from "./browser-sources";
 import * as db from "./local/db";
 import type { Target } from "./local/providers";
+import { devReloadWorker } from "./dev-reload";
 import { loadSettings, Settings } from "./local/settings";
 import { isWhitelisted, OffscreenMsg, OffscreenSession } from "./protocol";
 
@@ -46,12 +47,69 @@ async function ensurePaired(launch: boolean): Promise<Pairing | null> {
   return null;
 }
 
-startDesktopSourceSync(() => ensurePaired(false));
+startDesktopSourceSync(() => ensurePaired(false), (request) => void controlRecording(request.session_id, request.action, request).catch(console.error));
+
+type ControlAction = "pause" | "resume" | "mute" | "unmute" | "stop" | "cancel" | "mode" | "rename";
+
+async function patchAppSession(sessionId: string, patch: object) {
+  const p = await ensurePaired(false);
+  if (!p) throw new Error("The Mac app is not running");
+  const r = await fetch(`http://127.0.0.1:${p.port}/v1/sessions/${sessionId}`, {
+    method: "PATCH", headers: { Authorization: `Bearer ${p.token}`, "Content-Type": "application/json" }, body: JSON.stringify(patch),
+  });
+  if (!r.ok) throw new Error((await r.json().catch(() => null))?.error || `HTTP ${r.status}`);
+}
+
+/**
+ * One place for every control of a tab recording, from the side panel or the Mac app. The capture
+ * always runs here, so pause, playback and stop are applied here; recordings streamed to the Mac
+ * app also tell its engine (pause, mode, name).
+ */
+async function controlRecording(sessionId: string, action: ControlAction, extra: { mode?: "off" | "live" | "after"; name?: string | null } = {}) {
+  const entry = Object.entries(await tabsMap()).find(([, e]) => e.sessionId === sessionId);
+  // Broadcast requests reach every browser; playback and pause only apply where the tab is captured.
+  if (!entry && action !== "rename" && action !== "mode") return { ok: false };
+  const backend = entry?.[1].backend ?? ((await db.getSession(sessionId)) ? "local" : "app");
+  switch (action) {
+    case "pause":
+    case "resume": {
+      const paused = action === "pause";
+      if (backend === "app") await patchAppSession(sessionId, { paused });
+      return toOffscreen({ target: "offscreen", type: "pause", sessionId, paused });
+    }
+    case "mute":
+    case "unmute":
+      return toOffscreen({ target: "offscreen", type: "mute", sessionId, muted: action === "mute" });
+    case "stop":
+    case "cancel":
+      // "cancelled" discards the recording (the Mac app's engine or the local engine deletes it).
+      await toOffscreen({ target: "offscreen", type: "stop", sessionId, reason: action === "cancel" ? "cancelled" : "user" }).catch(() => {});
+      if (entry) await setTab(Number(entry[0]), null);
+      return { ok: true };
+    case "mode":
+      if (!extra.mode) return { error: "mode missing" };
+      if (backend === "app") await patchAppSession(sessionId, { summary_mode: extra.mode });
+      if (entry) await toOffscreen({ target: "offscreen", type: "mode", sessionId, mode: extra.mode });
+      else if (backend === "local") await db.patchSession(sessionId, { summary_mode: extra.mode });
+      return { ok: true };
+    case "rename": {
+      const name = extra.name?.trim() || null;
+      if (backend === "app") await patchAppSession(sessionId, { name: name ?? "" });
+      else await db.patchSession(sessionId, { name, name_auto: false });
+      chrome.runtime.sendMessage({ type: "local-event", event: { type: "status", session_id: sessionId, status: "renamed", backend } }).catch(() => {});
+      return { ok: true };
+    }
+  }
+}
 
 /** Which backend a new recording uses: the in-browser engine (default) or the Mac app. */
 async function chooseBackend(): Promise<{ backend: "local" | "app"; pairing: Pairing | null } | null> {
   const s = await loadSettings();
   if (s.appConnection === "standalone") return { backend: "local", pairing: null };
+  if (s.appConnection === "auto") {
+    const pairing = await ensurePaired(false);
+    return pairing ? { backend: "app", pairing } : { backend: "local", pairing: null };
+  }
   const pairing = await ensurePaired(true);
   return pairing ? { backend: "app", pairing } : null;
 }
@@ -126,7 +184,10 @@ function setTab(tabId: number, entry: TabEntry | null) {
   const update = tabUpdates.then(async () => {
     const tabs = await tabsMap();
     if (entry) tabs[tabId] = entry;
-    else delete tabs[tabId];
+    else {
+      if (tabs[tabId]) chrome.tabs.sendMessage(tabId, { type: "caption-stop" }).catch(() => {});
+      delete tabs[tabId];
+    }
     await chrome.storage.session.set({ tabs });
     const n = Object.keys(tabs).length;
     await chrome.action.setBadgeText({ text: n ? String(n) : "" });
@@ -134,6 +195,43 @@ function setTab(tabId: number, entry: TabEntry | null) {
   });
   tabUpdates = update.catch(console.error);
   return update;
+}
+
+type StartChoice = { mode?: "off" | "live" | "after"; muted?: boolean };
+const ARM_MS = 120_000;
+
+/**
+ * Chrome lets an extension capture a tab only after the user clicks its toolbar icon (or its
+ * shortcut or menu item) on that tab; a side panel click does not count and cannot be simulated.
+ * So a Record press that Chrome refuses arms the tab: the icon shows a blinking "REC" badge and a
+ * "Click to record" tooltip on that tab, and the next click starts recording with the choices made.
+ */
+async function armTab(tabId: number, choice: StartChoice) {
+  await chrome.storage.session.set({ [`armed:${tabId}`]: { ...choice, expires: Date.now() + ARM_MS } });
+  await chrome.action.setTitle({ tabId, title: chrome.i18n.getMessage("actionArmed") || "Click to record this tab" });
+  await chrome.action.setBadgeBackgroundColor({ tabId, color: "#e5484d" });
+  for (let i = 0; i < 8; i++) {
+    await chrome.action.setBadgeText({ tabId, text: i % 2 ? "" : "REC" }).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 450));
+  }
+  await chrome.action.setBadgeText({ tabId, text: "REC" }).catch(() => {});
+  setTimeout(() => void disarmTab(tabId, true), ARM_MS);
+}
+
+/** Clears the armed state; the badge falls back to the recording count. */
+async function disarmTab(tabId: number, onlyIfExpired = false) {
+  const key = `armed:${tabId}`;
+  const armed = (await chrome.storage.session.get(key))[key] as { expires: number } | undefined;
+  if (!armed || (onlyIfExpired && armed.expires > Date.now())) return;
+  await chrome.storage.session.remove(key);
+  await chrome.action.setBadgeText({ tabId, text: null as never }).catch(() => {});
+  await chrome.action.setTitle({ tabId, title: null as never }).catch(() => {});
+}
+
+async function armedChoice(tabId: number): Promise<StartChoice | undefined> {
+  const key = `armed:${tabId}`;
+  const armed = (await chrome.storage.session.get(key))[key] as (StartChoice & { expires: number }) | undefined;
+  return armed && armed.expires > Date.now() ? armed : undefined;
 }
 
 /** App backend: create the session; keep any duplicate-recording warning for the side panel. */
@@ -158,21 +256,27 @@ async function injectClock(tab: chrome.tabs.Tab) {
   if (tab.id === undefined || !isWhitelisted(tab.url)) return;
   try {
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["media-clock.js"] });
+    // Platform subtitles as the text source: runs in the page's world to use its player and session.
+    if ((await loadSettings()).textSource !== "asr") {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["captions-page.js"], world: "MAIN" });
+    }
   } catch {
     /* page not scriptable */
   }
 }
 
 /** Entry for the toolbar icon, keyboard shortcut and context menu (each grants activeTab). */
-async function startOrOpen(tab: chrome.tabs.Tab | undefined) {
+async function startOrOpen(tab: chrome.tabs.Tab | undefined, chosen?: StartChoice) {
   if (!tab?.id) return;
   chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
+  const choice = chosen ?? (await armedChoice(tab.id));
+  await disarmTab(tab.id);
   if ((await tabsMap())[tab.id]) return;
   const request = await desktopIntent(tab.id);
   const pairing = request ? await ensurePaired(false) : null;
   if (request && !pairing) throw new Error("The local Mac service is not running");
-  const choice = pairing ? { backend: "app" as const, pairing } : await chooseBackend();
-  if (!choice) {
+  const target = pairing ? { backend: "app" as const, pairing } : await chooseBackend();
+  if (!target) {
     await chrome.tabs.create({ url: chrome.runtime.getURL("onboarding.html") });
     return;
   }
@@ -186,15 +290,15 @@ async function startOrOpen(tab: chrome.tabs.Tab | undefined) {
     chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id }, (id) => (id ? resolve(id) : reject(new Error(chrome.runtime.lastError?.message || "no stream id")))),
   );
   const waitForAudio = !tab.audible || Boolean(tab.mutedInfo?.muted);
-  const common = { tabId: tab.id, title, url: tab.url, mode: request?.mode ?? settings.defaultMode, muted: request?.mute_playback ?? settings.silentCapture, waitForAudio, settings };
-  const p = choice.pairing;
+  const common = { tabId: tab.id, title, url: tab.url, mode: request?.mode ?? choice?.mode ?? settings.defaultMode, muted: request?.mute_playback ?? choice?.muted ?? settings.silentCapture, waitForAudio, settings };
+  const p = target.pairing;
   const id = p ? await createAppSession(p, { ...tab, title }, common.mode, waitForAudio) : undefined;
   try {
     const result = await toOffscreen<{ sessionId?: string; error?: string }>({
-      target: "offscreen", type: "start", streamId, backend: choice.backend, sessionId: id, port: p?.port, token: p?.token, ...common,
+      target: "offscreen", type: "start", streamId, backend: target.backend, sessionId: id, port: p?.port, token: p?.token, ...common,
     });
     if (!result?.sessionId) throw new Error(result?.error ?? "Could not start tab capture");
-    await setTab(tab.id, { sessionId: result.sessionId, backend: choice.backend });
+    await setTab(tab.id, { sessionId: result.sessionId, backend: target.backend });
     if (request) await clearDesktopIntent(tab.id);
   } catch (error) {
     if (p && id) {
@@ -220,7 +324,12 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === "mc-record") void startOrOpen(tab).catch((e) => console.error(e));
 });
 
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.url) void disarmTab(tabId);
+});
+
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  void chrome.storage.session.remove(`armed:${tabId}`);
   if ((await tabsMap())[tabId]) {
     await toOffscreen({ target: "offscreen", type: "stop", tabId, reason: "tab_closed" }).catch(() => {});
     await setTab(tabId, null);
@@ -236,11 +345,17 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
-  if (msg?.target === "offscreen" || msg?.type === "local-event") return false;
+  if (msg?.target === "offscreen" || msg?.type === "local-event" || msg?.type === "capture-state" || msg?.type === "dev-reload") return false;
   (async () => {
     switch (msg?.type) {
       case "media_mark":
         if (sender.tab?.id !== undefined) await toOffscreen({ target: "offscreen", type: "mark", tabId: sender.tab.id, mark: msg.mark });
+        return { ok: true };
+      case "caption":
+        if (sender.tab?.id !== undefined && (await tabsMap())[sender.tab.id]) {
+          const { textSource } = await loadSettings();
+          if (textSource !== "asr") await toOffscreen({ target: "offscreen", type: "caption", tabId: sender.tab.id, msg: msg.msg, policy: textSource });
+        }
         return { ok: true };
       case "pairing": {
         const s = await loadSettings();
@@ -257,6 +372,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       case "service-health":
         return serviceHealth();
       case "local-retry":
+      case "local-asr":
       case "local-flush": {
         await ensureOffscreen();
         return toOffscreen({ target: "offscreen", type: msg.type, sessionId: msg.sessionId });
@@ -266,15 +382,20 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
           ? (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]
           : await chrome.tabs.get(msg.tabId);
         if (!tab?.active) return { error: "Activate this tab before recording" };
-        await startOrOpen(tab);
+        try {
+          await startOrOpen(tab, { mode: msg.mode, muted: msg.muted });
+        } catch (error) {
+          if (tab.id === undefined || !/invoked|activeTab|permission|grant/i.test(String(error))) throw error;
+          void armTab(tab.id, { mode: msg.mode, muted: msg.muted });
+          const settings = await (chrome.action as any).getUserSettings?.().catch(() => null);
+          return { needsClick: true, pinned: settings?.isOnToolbar ?? true };
+        }
         return { ok: true };
       }
-      case "stop": {
-        await toOffscreen({ target: "offscreen", type: "stop", sessionId: msg.sessionId, reason: "user" }).catch(() => {});
-        const entry = Object.entries(await tabsMap()).find(([, e]) => e.sessionId === msg.sessionId);
-        if (entry) await setTab(Number(entry[0]), null);
-        return { ok: true };
-      }
+      case "stop":
+        return controlRecording(msg.sessionId, "stop");
+      case "recording-control":
+        return controlRecording(msg.sessionId, msg.action, msg);
       case "local-mode":
         return toOffscreen({ target: "offscreen", type: "local-mode", sessionId: msg.sessionId, mode: msg.mode });
       case "local-missed":
@@ -312,3 +433,5 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   })().then(reply, (e) => reply({ error: String(e) }));
   return true;
 });
+
+devReloadWorker(async () => Object.keys(await tabsMap()).length > 0);

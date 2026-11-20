@@ -81,6 +81,10 @@ importers:
         version: 2.1.8
 
   packages/ui:
+    dependencies:
+      wavesurfer.js:
+        specifier: 7.12.12
+        version: 7.12.12
     devDependencies:
       '@types/react':
         specifier: 18.3.12

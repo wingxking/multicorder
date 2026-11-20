@@ -13,5 +13,8 @@
   },
   "menuRecord": {
     "message": "Record this tab with Multicorder"
+  },
+  "actionArmed": {
+    "message": "Click to record this tab"
   }
 }

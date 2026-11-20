@@ -19,6 +19,11 @@ export interface Session {
   audio_ms: number;
   sample_rate?: number;
   bits_per_sample?: number;
+  /** The recording's own name (typed by the user, or by the model when `name_auto`); else the UI shows the source title. */
+  name?: string | null;
+  name_auto?: boolean;
+  /** Active app recordings: whether the app is silenced on the speakers. */
+  muted?: boolean;
   /** Transcription health (Mac app sessions and standalone sessions). */
   asr?: { state: "ok" | "degraded"; failed_chunks: number; failed_ms?: number };
 }
@@ -58,7 +63,16 @@ export type EngineEvent =
   | { type: "insight"; session_id: string; insight: Insight }
   | { type: "gap"; session_id: string; start_ms: number; end_ms: number; cause: string }
   | { type: "report"; session_id: string; is_final: boolean }
-  | { type: "backlog"; session_id: string; pending_chunks: number };
+  | { type: "backlog"; session_id: string; pending_chunks: number }
+  | { type: "text_source"; session_id: string; source: CaptionSource | null; active: boolean };
+
+/** Subtitles a video platform serves for a recorded tab (used instead of speech recognition). */
+export interface CaptionSource {
+  platform: "youtube" | "bilibili" | "tiktok" | "douyin" | "web" | string;
+  kind: "creator" | "auto" | "live" | string;
+  lang: string | null;
+  languages?: string[];
+}
 
 export interface Pairing {
   port: number;
@@ -99,6 +113,12 @@ export class Api {
   }
   stop(id: string) {
     return this.req(`/v1/sessions/${id}/stop`, { method: "POST" });
+  }
+  cancel(id: string) {
+    return this.req(`/v1/sessions/${id}/cancel`, { method: "POST" });
+  }
+  delete(id: string) {
+    return this.req(`/v1/sessions/${id}`, { method: "DELETE" });
   }
   transcript(id: string) {
     return this.req<TranscriptEvent[]>(`/v1/sessions/${id}/transcript`);

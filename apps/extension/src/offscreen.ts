@@ -4,7 +4,7 @@
 // ("local" backend, design 5.11).
 
 import { LocalEngine } from "./local/engine";
-import { encodeFrame, MediaMark, OffscreenMsg, OffscreenSession, PRE_ROLL_MS } from "./protocol";
+import { AUDIO_START_DB, CaptureState, encodeFrame, MediaMark, OffscreenMsg, OffscreenSession, PRE_ROLL_MS } from "./protocol";
 
 const RESEND_FRAMES = 600; // 60 s
 const MAX_BUFFERED_BYTES = 512 * 1024;
@@ -100,8 +100,8 @@ class IngestPipe {
     return this.frames.length;
   }
 
-  close(stop = false) {
-    if (stop) this.control({ t: "stop", reason: "user" });
+  close(stop = false, reason = "user") {
+    if (stop) this.control({ t: "stop", reason });
     this.closed = true;
     setTimeout(() => this.ws?.close(), 300);
   }
@@ -120,12 +120,42 @@ interface Live {
   tap: AudioWorkletNode;
   pipe: IngestPipe | null;
   levelDb: number;
+  title: string;
+  mode: "off" | "live" | "after";
+  startedAt: string;
+  /** Armed recordings wait for the first sound before the clock starts. */
+  waiting: boolean;
+  paused: boolean;
+  elapsedMs: number;
+  /** Waveform peaks not reported yet. */
+  peaks: number[];
 }
 
 const live = new Map<string, Live>();
 
+const PEAKS_PER_FRAME = 4; // 100 ms frames → 40 peaks per second, like the Mac app
+let reported = false;
+
+/** Reports every recording's state to the side panel and (through the worker) the Mac app. */
+function reportState() {
+  if (!live.size && !reported) return;
+  reported = live.size > 0;
+  const recordings = [...live.values()].map<CaptureState>((s) => {
+    const peaks = s.peaks;
+    s.peaks = [];
+    return {
+      tab_id: s.tabId, session_id: s.sessionId, backend: s.backend,
+      status: s.paused ? "paused" : s.waiting ? "waiting" : "capturing", paused: s.paused, muted: s.gain.gain.value === 0,
+      mode: s.mode, title: s.title, started_at: s.startedAt, elapsed_ms: s.elapsedMs, level_db: s.levelDb, peaks,
+    };
+  });
+  chrome.runtime.sendMessage({ type: "capture-state", recordings }).catch(() => {});
+}
+setInterval(reportState, 250);
+
 function stop(s: Live, reason: string, tellApp: boolean) {
   live.delete(s.sessionId);
+  reportState();
   s.tap.port.onmessage = null;
   s.src.disconnect();
   s.gain.disconnect();
@@ -144,7 +174,7 @@ function stop(s: Live, reason: string, tellApp: boolean) {
     void local.stop(s.sessionId, reason, s.archiveDelay ? PRE_ROLL_MS : 0, release).catch(console.error).finally(release);
   } else {
     release();
-    s.pipe?.close(tellApp);
+    s.pipe?.close(tellApp, reason === "cancelled" ? "cancelled" : "user");
   }
   chrome.runtime.sendMessage({ type: "offscreen-ended", sessionId: s.sessionId, tabId: s.tabId, reason }).catch(() => {});
 }
@@ -183,13 +213,29 @@ async function wire(opts: StartBase, src: MediaStreamAudioSourceNode | MediaElem
       if (s) stop(s, reason, false);
     });
   }
-  const entry: Live = { sessionId, backend: opts.backend, tabId: opts.tabId, stream, archiveStream, archiveDelay, element, src, gain, tap, pipe, levelDb: -120 };
+  const entry: Live = {
+    sessionId, backend: opts.backend, tabId: opts.tabId, stream, archiveStream, archiveDelay, element, src, gain, tap, pipe, levelDb: -120,
+    title: opts.title ?? "Browser tab", mode: opts.mode ?? "live", startedAt: new Date().toISOString(), waiting: !!opts.waitForAudio, paused: false, elapsedMs: 0, peaks: [],
+  };
   tap.port.onmessage = (e) => {
     if (e.data.kind === "pcm") {
       const pcm = new Int16Array(e.data.buf);
       entry.levelDb = e.data.db;
+      if (entry.waiting && entry.levelDb >= AUDIO_START_DB) entry.waiting = false;
+      if (!entry.paused && !entry.waiting) {
+        entry.elapsedMs += Math.round((pcm.length / 16000) * 1000);
+        const size = Math.ceil(pcm.length / PEAKS_PER_FRAME);
+        for (let start = 0; start < pcm.length; start += size) {
+          let peak = 0;
+          for (let i = start; i < Math.min(pcm.length, start + size); i++) peak = Math.max(peak, Math.abs(pcm[i]));
+          entry.peaks.push(peak / 32768);
+        }
+        if (entry.peaks.length > 400) entry.peaks.splice(0, entry.peaks.length - 400);
+      }
+      // The Mac app drops frames itself while paused (its clock stays continuous); the
+      // in-browser engine is simply not fed.
       if (entry.pipe) entry.pipe.push(pcm);
-      else local.push(sessionId, pcm, entry.levelDb);
+      else if (!entry.paused) local.push(sessionId, pcm, entry.levelDb);
     }
   };
   stream?.getAudioTracks()[0]?.addEventListener("ended", () => {
@@ -251,21 +297,53 @@ chrome.runtime.onMessage.addListener((msg: OffscreenMsg, _sender, reply) => {
         s?.pipe?.control({ t: "media_mark", ...m });
         return { ok: true };
       }
-      case "navigation":
-        byTab(msg.tabId)?.pipe?.control({ t: "navigation", url: msg.url, title: msg.title });
+      case "caption": {
+        const s = byTab(msg.tabId);
+        if (!s || s.paused) return { ok: true };
+        if (s.backend === "local") local.caption(s.sessionId, msg.msg, msg.policy);
+        else if (msg.msg.kind === "cue") s.pipe?.control({ t: "caption", wall_ms: msg.msg.wall_ms, dur_ms: msg.msg.dur_ms, text: msg.msg.text, source: msg.msg.source });
+        else s.pipe?.control({ t: "caption_state", active: msg.msg.active, source: msg.msg.source, policy: msg.policy });
         return { ok: true };
+      }
+      case "navigation": {
+        const s = byTab(msg.tabId);
+        if (s && msg.title) s.title = msg.title;
+        s?.pipe?.control({ t: "navigation", url: msg.url, title: msg.title });
+        return { ok: true };
+      }
       case "mute": {
         const s = live.get(msg.sessionId);
         if (s) s.gain.gain.value = msg.muted ? 0 : 1;
+        reportState();
         return { ok: true };
       }
-      case "local-mode":
+      case "pause": {
+        const s = live.get(msg.sessionId);
+        if (!s) return { error: "This recording has ended" };
+        s.paused = msg.paused;
+        if (s.backend === "local") await local.setPaused(msg.sessionId, msg.paused);
+        reportState();
+        return { ok: true };
+      }
+      case "mode": {
+        const s = live.get(msg.sessionId);
+        if (s) s.mode = msg.mode;
+        if (s?.backend === "local") await local.setMode(msg.sessionId, msg.mode);
+        reportState();
+        return { ok: true };
+      }
+      case "local-mode": {
+        const s = live.get(msg.sessionId);
+        if (s) s.mode = msg.mode;
         await local.setMode(msg.sessionId, msg.mode);
         return { ok: true };
+      }
       case "local-missed":
         return local.missed(msg.sessionId, msg.minutes);
       case "local-retry":
         return local.retry(msg.sessionId);
+      case "local-asr":
+        return local.transcribeWithAsr(msg.sessionId).catch((e) => ({ error: String((e as Error).message ?? e) }));
       case "local-flush":
         await local.flush(msg.sessionId);
         return { ok: true };

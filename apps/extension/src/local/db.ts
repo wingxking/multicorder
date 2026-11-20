@@ -23,6 +23,9 @@ export interface LocalSession {
   asr?: { state: "ok" | "degraded"; failed_chunks: number; failed_ms?: number };
   report_pending?: boolean;
   last_error?: string | null;
+  /** The recording's own name (typed, or written by the model when `name_auto`). */
+  name?: string | null;
+  name_auto?: boolean;
 }
 
 /** A part of a recording whose transcription failed; retried from the OPFS recording. */
@@ -140,6 +143,18 @@ export async function search(q: string): Promise<{ session: LocalSession; seg: S
   const out: { session: LocalSession; seg: Seg }[] = [];
   for (const s of await listSessions()) for (const seg of await transcript(s.id)) if (seg.text.toLowerCase().includes(needle)) out.push({ session: s, seg });
   return out;
+}
+
+/** Removes a recording's text (transcript, key points, report, pending parts) but keeps its audio. */
+export async function clearText(id: string) {
+  const db = await openDb();
+  const tx = db.transaction(["transcripts", "insights", "reports", "pending"], "readwrite");
+  tx.objectStore("reports").delete(id);
+  for (const [name, idx] of [["transcripts", "sessionId"], ["insights", "session_id"], ["pending", "sessionId"]] as const) {
+    const keys: IDBValidKey[] = await wrap(tx.objectStore(name).index(idx).getAllKeys(id));
+    keys.forEach((k) => tx.objectStore(name).delete(k));
+  }
+  await new Promise((res, rej) => ((tx.oncomplete = res), (tx.onerror = () => rej(tx.error))));
 }
 
 export async function deleteSession(id: string) {

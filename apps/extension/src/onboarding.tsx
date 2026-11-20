@@ -1,5 +1,6 @@
 // First-run page: what the extension does, how to connect the Mac app, and a consent reminder.
 
+import { devReloadPage } from "./dev-reload";
 import React, { useEffect } from "react";
 import { createRoot } from "react-dom/client";
 import { applyTheme, Icon, LangToggle, t, THEME_CSS, ThemeToggle, useLang } from "@multicorder/ui";
@@ -57,4 +58,5 @@ h1{font-size:20px}
 const style = document.createElement("style");
 style.textContent = THEME_CSS + CSS;
 document.head.appendChild(style);
+devReloadPage();
 createRoot(document.getElementById("root")!).render(<App />);

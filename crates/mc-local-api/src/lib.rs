@@ -78,6 +78,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/sessions/{id}", get(get_session).patch(patch_session).delete(delete_session))
         .route("/v1/sessions/{id}/stop", post(stop_session))
+        .route("/v1/sessions/{id}/cancel", post(cancel_session))
         .route("/v1/sessions/{id}/transcript", get(transcript))
         .route("/v1/sessions/{id}/insights", get(insights))
         .route("/v1/sessions/{id}/report", get(report))
@@ -321,6 +322,10 @@ async fn llm_chat(State(s): State<ApiState>, Json(b): Json<ChatBody>) -> Respons
 struct Patch {
     summary_mode: Option<SummaryMode>,
     title: Option<String>,
+    /// Pauses or resumes capture (frames that keep arriving while paused are dropped).
+    paused: Option<bool>,
+    /// The recording's own name; an empty string goes back to the source title.
+    name: Option<String>,
 }
 
 async fn patch_session(State(s): State<ApiState>, Path(id): Path<String>, Json(p): Json<Patch>) -> ApiResult<Json<serde_json::Value>> {
@@ -330,11 +335,23 @@ async fn patch_session(State(s): State<ApiState>, Path(id): Path<String>, Json(p
     if let Some(t) = p.title {
         s.engine.store.set_title(&id, &t)?;
     }
+    if let Some(paused) = p.paused {
+        s.engine.set_paused(&id, paused)?;
+    }
+    if let Some(name) = p.name {
+        s.engine.store.set_name(&id, Some(&name))?;
+        s.engine.emit(mc_core::EngineEvent::Status { session_id: id.clone(), status: s.engine.store.session(&id)?.map(|r| r.status).unwrap_or_default(), detail: Some("renamed".into()) });
+    }
     Ok(Json(json!({"ok": true})))
 }
 
 async fn stop_session(State(s): State<ApiState>, Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
     s.engine.stop_session(&id, "user")?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn cancel_session(State(s): State<ApiState>, Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+    s.engine.cancel_session(&id)?;
     Ok(Json(json!({"ok": true})))
 }
 

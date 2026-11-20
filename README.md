@@ -46,6 +46,22 @@ pnpm --filter @multicorder/extension build         # → apps/extension/dist (lo
 pnpm --filter @multicorder/desktop app:debug        # → target/debug/bundle/macos/Multicorder.app
 ```
 
+### Live reload while developing
+
+```bash
+pnpm dev        # Mac app and Chrome extension together, with prefixed output
+pnpm dev:app    # Mac app only (tauri dev)
+pnpm dev:ext    # Chrome extension only (watch build)
+```
+
+- **Mac app:** UI edits (`apps/desktop/src`, `packages/ui`) apply at once through Vite; Rust edits
+  rebuild and restart the app (recordings in progress stop).
+- **Chrome extension:** load `apps/extension/dist` as an unpacked extension once. After that it
+  follows the watch build: side panel and page edits refresh those pages in place, and worker,
+  offscreen or manifest edits reload the whole extension. A full reload waits until no tab is
+  being recorded (the toolbar badge shows ↻ meanwhile). The watch build serves its build number
+  on `127.0.0.1:35830`; production builds (`build`) never contact it.
+
 Providers and keys live in `~/Library/Application Support/Multicorder/config.json`
 (created on first run; keys may also come from the environment variable named by `api_key_env`).
 

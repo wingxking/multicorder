@@ -78,7 +78,17 @@ function eligible(tab: chrome.tabs.Tab): boolean {
   return tab.id !== undefined && !tab.incognito && /^(https?|file):/.test(tab.url ?? "");
 }
 
-export function startDesktopSourceSync(pair: () => Promise<DesktopPairing | null>) {
+/** A control request from the Mac app for a tab recording this browser captures. */
+export interface ControlRequest {
+  t: "control";
+  action: "pause" | "resume" | "mute" | "unmute" | "stop" | "cancel" | "mode" | "rename";
+  session_id: string;
+  tab_id: number;
+  mode?: SummaryMode;
+  name?: string | null;
+}
+
+export function startDesktopSourceSync(pair: () => Promise<DesktopPairing | null>, onControl: (request: ControlRequest) => void) {
   let socket: WebSocket | undefined;
   let connecting = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -139,7 +149,11 @@ export function startDesktopSourceSync(pair: () => Promise<DesktopPairing | null
         heartbeat = setInterval(() => void send(connection, pairing), HEARTBEAT_MS);
       };
       connection.onmessage = ({ data }) => {
-        if (typeof data === "string") void focus(data).catch(() => {});
+        if (typeof data !== "string") return;
+        let message: { t?: string } | null = null;
+        try { message = JSON.parse(data); } catch { return; }
+        if (message?.t === "control") onControl(message as ControlRequest);
+        else void focus(data).catch(() => {});
       };
       connection.onerror = () => connection.close();
       connection.onclose = () => {
@@ -164,6 +178,13 @@ export function startDesktopSourceSync(pair: () => Promise<DesktopPairing | null
   }
 
   publish = () => void connect();
+  // Live recording state from the offscreen document goes straight to the app (it is small and
+  // arrives four times a second while recording; one empty report follows the last recording).
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type !== "capture-state") return;
+    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ t: "recordings", recordings: message.recordings }));
+    else if (message.recordings?.length) void connect();
+  });
   const changed = () => publish();
   chrome.tabs.onCreated.addListener(changed);
   chrome.tabs.onRemoved.addListener((id) => {

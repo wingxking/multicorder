@@ -1,5 +1,5 @@
 import React from "react";
-import { fmtTs, Insight, Session, SummaryMode, TranscriptEvent } from "./api";
+import { CaptionSource, fmtTs, Insight, Session, SummaryMode, TranscriptEvent } from "./api";
 import { Icon } from "./icons";
 import { locale, t, tError } from "./i18n";
 
@@ -18,6 +18,8 @@ export interface CardState {
   backlog?: number;
   asr?: AsrHealth;
   retrying?: boolean;
+  /** Where the text comes from right now (platform subtitles or speech recognition). */
+  textSource?: { source: CaptionSource | null; active: boolean };
 }
 
 export const ACTIVE_SESSION_STATUSES = ["starting", "waiting", "capturing", "paused", "reconnecting", "stopping"];
@@ -35,12 +37,12 @@ export function levelPct(db?: number): number {
 
 function statusChip(status: string, degraded: boolean, empty: boolean) {
   if (status === "waiting") return <span className="chip info"><span className="dot" />{t("Waiting for audio")}</span>;
-  if (status === "paused") return <span className="chip info">{t("Paused")}</span>;
+  if (status === "paused") return <span className="chip warn">{t("Paused")}</span>;
   if (status === "capturing" || status === "starting") return <span className="chip rec"><span className="dot" />{t("Recording")}</span>;
   if (status === "reconnecting") return <span className="chip warn"><span className="dot" />{t("Reconnecting")}</span>;
   if (status === "stopping") return <span className="chip info">{t("Finishing")}</span>;
   if (status === "processing") return <span className="chip info">{t("Processing")}</span>;
-  if (status === "failed") return <span className="chip warn">{t("Failed")}</span>;
+  if (status === "failed") return <span className="chip err">{t("Failed")}</span>;
   if (empty) return <span className="chip">{t("No audio")}</span>;
   return degraded ? <span className="chip warn">{t("Text missing")}</span> : <span className="chip">{t("Done")}</span>;
 }

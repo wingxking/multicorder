@@ -106,12 +106,16 @@ struct TapSlot {
 
 struct Shared {
     active_gen: AtomicU64,
+    /// Whether the app is silenced while tapped; `mute_changed` asks the supervisor to apply it.
+    mute_playback: AtomicBool,
+    mute_changed: AtomicBool,
     last_audio: Mutex<Instant>,
     nonzero_seen: AtomicBool,
 }
 
 pub struct AppCapture {
     stop: Arc<AtomicBool>,
+    shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -121,16 +125,33 @@ impl AppCapture {
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
             active_gen: AtomicU64::new(0),
+            mute_playback: AtomicBool::new(mute_playback),
+            mute_changed: AtomicBool::new(false),
             last_audio: Mutex::new(Instant::now()),
             nonzero_seen: AtomicBool::new(false),
         });
         let stop2 = stop.clone();
+        let shared2 = shared.clone();
         // Core Audio can block while macOS waits for the user to answer a permission prompt.
         // Start the supervisor before tapping so the armed recording can still be controlled.
         let thread = std::thread::Builder::new()
             .name(format!("mc-app-{app_id}"))
-            .spawn(move || supervise(app_id, mute_playback, sample_rate, shared, sink, events, stop2))?;
-        Ok(Self { stop, thread: Some(thread) })
+            .spawn(move || supervise(app_id, sample_rate, shared2, sink, events, stop2))?;
+        Ok(Self { stop, shared, thread: Some(thread) })
+    }
+
+    /// Plays the app through the speakers again (`false`) or silences it (`true`) while the
+    /// recording continues; applied to the running tap within ~200 ms.
+    pub fn set_mute_playback(&self, mute_playback: bool) {
+        self.shared.mute_playback.store(mute_playback, Ordering::Release);
+        self.shared.mute_changed.store(true, Ordering::Release);
+        if let Some(thread) = &self.thread {
+            thread.thread().unpark();
+        }
+    }
+
+    pub fn mute_playback(&self) -> bool {
+        self.shared.mute_playback.load(Ordering::Acquire)
     }
 }
 
@@ -150,7 +171,8 @@ fn find_app(app_id: &str) -> Result<Option<AppAudioInfo>> {
     Ok(list_apps()?.into_iter().find(|a| a.app_id == app_id))
 }
 
-fn make_tap(app_id: &str, objs: &[u32], gen: u64, mute_playback: bool, sample_rate: u32, shared: Arc<Shared>, sink: AudioSink) -> Result<TapSlot> {
+fn make_tap(app_id: &str, objs: &[u32], gen: u64, sample_rate: u32, shared: Arc<Shared>, sink: AudioSink) -> Result<TapSlot> {
+    let mute_playback = shared.mute_playback.load(Ordering::Acquire);
     let resampler: Mutex<Option<StreamResampler>> = Mutex::new(None);
     let raw: crate::tap::RawSink = Arc::new(move |samples: &[f32], rate: u32| {
         // The first audio of a newer generation switches the output to it (make-before-break).
@@ -180,7 +202,7 @@ fn make_tap(app_id: &str, objs: &[u32], gen: u64, mute_playback: bool, sample_ra
     Ok(TapSlot { tap, gen, objs: objs.to_vec() })
 }
 
-fn supervise(app_id: String, mute_playback: bool, sample_rate: u32, shared: Arc<Shared>, sink: AudioSink, events: EventSink, stop: Arc<AtomicBool>) {
+fn supervise(app_id: String, sample_rate: u32, shared: Arc<Shared>, sink: AudioSink, events: EventSink, stop: Arc<AtomicBool>) {
     let mut current: Option<TapSlot> = None;
     let mut retiring: Vec<(TapSlot, Instant)> = Vec::new();
     let mut gen = 0;
@@ -189,6 +211,14 @@ fn supervise(app_id: String, mute_playback: bool, sample_rate: u32, shared: Arc<
     let started = Instant::now();
     let mut last_poll = Instant::now() - Duration::from_secs(10);
     while !stop.load(Ordering::Relaxed) {
+        if shared.mute_changed.swap(false, Ordering::AcqRel) {
+            let mute = shared.mute_playback.load(Ordering::Acquire);
+            for slot in current.iter_mut().chain(retiring.iter_mut().map(|(slot, _)| slot)) {
+                if let Err(e) = slot.tap.set_mute_playback(mute) {
+                    events(CaptureEvent::Error(format!("could not change playback: {e}")));
+                }
+            }
+        }
         // Old taps are dropped once the new one is active, or after 2 s regardless.
         let active = shared.active_gen.load(Ordering::Acquire);
         retiring.retain(|(slot, since)| !(slot.gen < active || since.elapsed() > Duration::from_secs(2)));
@@ -220,7 +250,7 @@ fn supervise(app_id: String, mute_playback: bool, sample_rate: u32, shared: Arc<
         }
         let Some(slot) = current.as_ref() else {
             gen += 1;
-            match make_tap(&app_id, &app.process_objs, gen, mute_playback, sample_rate, shared.clone(), sink.clone()) {
+            match make_tap(&app_id, &app.process_objs, gen, sample_rate, shared.clone(), sink.clone()) {
                 Ok(slot) => {
                     current = Some(slot);
                     events(CaptureEvent::Started { process_objs: app.process_objs });
@@ -244,7 +274,7 @@ fn supervise(app_id: String, mute_playback: bool, sample_rate: u32, shared: Arc<
         if set_changed || dead || stalled {
             let reason = if set_changed { "process_set_changed" } else { "tap_stalled" };
             gen += 1;
-            match make_tap(&app_id, &app.process_objs, gen, mute_playback, sample_rate, shared.clone(), sink.clone()) {
+            match make_tap(&app_id, &app.process_objs, gen, sample_rate, shared.clone(), sink.clone()) {
                 Ok(slot) => {
                     if let Some(old) = current.replace(slot) {
                         retiring.push((old, Instant::now()));

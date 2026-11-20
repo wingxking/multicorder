@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS capture_sessions (
   failure TEXT,
   sample_rate INTEGER NOT NULL DEFAULT 16000,
   bits_per_sample INTEGER NOT NULL DEFAULT 16,
-  audio_ms INTEGER NOT NULL DEFAULT 0
+  audio_ms INTEGER NOT NULL DEFAULT 0,
+  name TEXT,
+  name_auto INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS audio_segments (
   session_id TEXT NOT NULL REFERENCES capture_sessions(id),
@@ -110,6 +112,10 @@ pub struct SessionRow {
     pub audio_ms: i64,
     pub sample_rate: u32,
     pub bits_per_sample: u16,
+    /// The recording's own name: typed by the user, or written by the model (`name_auto`) after
+    /// the summary. `None` means the UI shows the source's title.
+    pub name: Option<String>,
+    pub name_auto: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,6 +201,8 @@ fn session_from_row(r: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
         audio_ms: r.get("audio_ms")?,
         sample_rate: r.get("sample_rate")?,
         bits_per_sample: r.get("bits_per_sample")?,
+        name: r.get("name")?,
+        name_auto: r.get("name_auto")?,
     })
 }
 
@@ -254,6 +262,10 @@ impl Store {
         }
         if !has_column("capture_sessions", "bits_per_sample")? {
             tx.execute("ALTER TABLE capture_sessions ADD COLUMN bits_per_sample INTEGER NOT NULL DEFAULT 16", [])?;
+        }
+        if !has_column("capture_sessions", "name")? {
+            tx.execute("ALTER TABLE capture_sessions ADD COLUMN name TEXT", [])?;
+            tx.execute("ALTER TABLE capture_sessions ADD COLUMN name_auto INTEGER NOT NULL DEFAULT 0", [])?;
         }
         tx.commit()?;
         Ok(Self { conn: Mutex::new(conn) })
@@ -337,6 +349,26 @@ impl Store {
             params![session_id, title],
         )?;
         Ok(())
+    }
+
+    /// The user's name for a recording; `None` (or blank) goes back to the source's title.
+    pub fn set_name(&self, session_id: &str, name: Option<&str>) -> anyhow::Result<()> {
+        let name = name.map(str::trim).filter(|n| !n.is_empty());
+        self.db().execute("UPDATE capture_sessions SET name=?2, name_auto=0 WHERE id=?1", params![session_id, name])?;
+        Ok(())
+    }
+
+    /// A model-written name; never replaces one the user typed. Returns whether it was applied.
+    pub fn set_auto_name(&self, session_id: &str, name: &str) -> anyhow::Result<bool> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(false);
+        }
+        let n = self.db().execute(
+            "UPDATE capture_sessions SET name=?2, name_auto=1 WHERE id=?1 AND (name IS NULL OR name_auto=1)",
+            params![session_id, name],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn set_video(&self, session_id: &str, url: Option<&str>, video_key: Option<&str>) -> anyhow::Result<()> {
@@ -651,6 +683,19 @@ impl Store {
         )?)
     }
 
+    /// Removes a session's text (transcript, key points, report, pending retries) so it can be
+    /// transcribed again from its audio.
+    pub fn clear_transcript(&self, session_id: &str) -> anyhow::Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        for table in ["transcript_events", "insight_events", "reports", "asr_failures"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE session_id=?1"), params![session_id])?;
+        }
+        tx.execute("DELETE FROM transcript_fts WHERE session_id=?1", params![session_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Removes every row of a session (audio files are removed by the caller).
     pub fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
         let mut db = self.db();
@@ -691,6 +736,20 @@ mod tests {
             .create_source(&NewSource { kind: "chromium_tab", title, app_bundle_id: None, capture_source_id: None, url: None, video_key: None })
             .unwrap();
         store.create_session(&src, "live", None, None).unwrap()
+    }
+
+    #[test]
+    fn model_names_never_replace_user_names() {
+        let store = Store::open_memory().unwrap();
+        let id = session(&store, "Tab");
+        assert!(store.set_auto_name(&id, "Weekly sync").unwrap());
+        assert!(store.set_auto_name(&id, "Weekly sync, take two").unwrap());
+        store.set_name(&id, Some("  My call ")).unwrap();
+        assert!(!store.set_auto_name(&id, "Other").unwrap());
+        let row = store.session(&id).unwrap().unwrap();
+        assert_eq!((row.name.as_deref(), row.name_auto), (Some("My call"), false));
+        store.set_name(&id, Some(" ")).unwrap();
+        assert_eq!(store.session(&id).unwrap().unwrap().name, None);
     }
 
     #[test]

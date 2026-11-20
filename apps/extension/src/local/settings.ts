@@ -1,9 +1,16 @@
 // Extension settings (chrome.storage.local). Keys stay in this browser profile, are only read by
 // extension pages and the service worker, and are never logged.
 
-export type AppConnection = "standalone" | "app";
+/** "auto": the Mac app when it is running, otherwise this browser. */
+export type AppConnection = "auto" | "standalone" | "app";
 export type ServiceEnv = "local" | "cloud" | "custom";
 export type SummaryMode = "off" | "live" | "after";
+/**
+ * Where a tab recording's text comes from. "auto": the platform's own subtitles when the video
+ * has them (YouTube, Bilibili, TikTok, Douyin, a page's text tracks), speech recognition for the
+ * rest; "asr": always speech recognition; "captions": subtitles only, never speech recognition.
+ */
+export type TextSource = "auto" | "asr" | "captions";
 
 export const CLOUD_URL = "https://multicoder.followkol.live";
 
@@ -30,11 +37,14 @@ export interface LlmProvider {
 export interface Settings {
   /** Where recordings are processed and stored: in this browser, or in the Mac app. */
   appConnection: AppConnection;
+  /** Set once the user picks a processing place; until then "standalone" from older versions means the old default. */
+  connectionChosen?: boolean;
   /** Which transcription + summary service the in-browser engine calls. */
   service: ServiceEnv;
   cloudUrl: string;
   cloudToken: string;
   defaultMode: SummaryMode;
+  textSource: TextSource;
   silentCapture: boolean;
   outputLang: string;
   /** Only used when service = "custom". */
@@ -43,11 +53,12 @@ export interface Settings {
 }
 
 export const DEFAULTS: Settings = {
-  appConnection: "standalone",
+  appConnection: "auto",
   service: "local",
   cloudUrl: CLOUD_URL,
   cloudToken: "",
   defaultMode: "live",
+  textSource: "auto",
   silentCapture: true,
   outputLang: "zh",
   asr: { provider: "moss", protocol: "moss", baseUrl: "https://api.mosi.cn/v1", model: "moss-transcribe-diarize-pro", apiKey: "", segmented: true, language: "", usdPerMinute: 0.005 },
@@ -62,8 +73,11 @@ export function normalize(s: Partial<Settings> & Record<string, unknown>): Setti
   return {
     ...DEFAULTS,
     ...s,
-    appConnection: legacyConn === "app" ? "app" : "standalone",
+    // "app" was always a deliberate choice; "standalone" was the old default, so it becomes Auto
+    // unless the user picked it on the Settings page.
+    appConnection: legacyConn === "app" ? "app" : legacyConn === "standalone" && s.connectionChosen ? "standalone" : "auto",
     service: (["local", "cloud", "custom"] as const).includes(s.service as ServiceEnv) ? (s.service as ServiceEnv) : DEFAULTS.service,
+    textSource: (["auto", "asr", "captions"] as const).includes(s.textSource as TextSource) ? (s.textSource as TextSource) : DEFAULTS.textSource,
     asr: { ...DEFAULTS.asr, ...(s.asr || {}) },
     llm: s.llm?.length ? s.llm : DEFAULTS.llm,
   };
