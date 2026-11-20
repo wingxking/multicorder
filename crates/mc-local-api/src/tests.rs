@@ -184,3 +184,53 @@ async fn retry_status_and_audio_export() {
     assert_eq!(retry["queued"], 1);
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test]
+async fn tab_inventory_keeps_parallel_sources_separate_and_routes_focus() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    let (api, dir) = start().await;
+    let endpoint = format!("ws://{}/v1/browser-sources", api.addr);
+    assert!(tokio_tungstenite::connect_async(&endpoint).await.is_err());
+
+    let mut request = endpoint.into_client_request().unwrap();
+    request.headers_mut().insert("Sec-WebSocket-Protocol", "mc.v1, secret-token".parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let snapshot = json!({ "client_id": "chrome-fixture", "browser": "com.google.Chrome", "tabs": [
+        {"id": 81, "title": "YouTube 1", "site": "www.youtube.com", "audible": true},
+        {"id": 82, "title": "YouTube 1", "site": "www.youtube.com", "audible": true},
+        {"id": 83, "title": "Bilibili 1", "site": "www.bilibili.com", "audible": true},
+        {"id": 84, "title": "Bilibili 2", "site": "www.bilibili.com", "audible": true}
+    ] });
+    socket.send(Message::Text(snapshot.to_string().into())).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while api.browser_sources.list().len() != 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+
+    let list = serde_json::to_value(api.browser_sources.list()).unwrap();
+    assert_ne!(list[0]["source_id"], list[1]["source_id"]);
+    assert_eq!(list[0]["app"], "Google Chrome");
+    assert_eq!(list[3]["title"], "Bilibili 2");
+    let target = list[3]["source_id"].as_str().unwrap();
+    api.browser_sources.focus(target, mc_core::SummaryMode::Off, true).unwrap();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(3), socket.next()).await.unwrap().unwrap().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(response.to_text().unwrap()).unwrap(),
+        json!({"tab_id": 84, "mode": "off", "mute_playback": true}));
+
+    let created: Value = reqwest::Client::new()
+        .post(format!("http://{}/v1/sessions", api.addr)).bearer_auth("secret-token")
+        .json(&json!({"source":{"kind":"chromium_tab","browser":"com.google.Chrome","tab_id":84}, "browser_client_id":"chrome-fixture","summary_mode":"off"}))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(created["session"]["capture_source_id"], target);
+    socket.close(None).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !api.browser_sources.list().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    api.task.abort();
+    std::fs::remove_dir_all(dir).ok();
+}

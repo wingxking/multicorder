@@ -24,3 +24,4 @@ reqwest.workspace = true
 mc-asr.workspace = true
 mc-insight.workspace = true
 async-trait.workspace = true
+tokio-tungstenite = "=0.29.0"

@@ -11,6 +11,7 @@ pub struct Runtime {
     pub engine: Arc<Engine>,
     pub port: u16,
     pub token: String,
+    pub browser_sources: Arc<crate::BrowserSources>,
     _api: tokio::task::JoinHandle<()>,
     _pairing: tokio::task::JoinHandle<()>,
 }
@@ -24,7 +25,7 @@ pub async fn start_with_engine(engine: Arc<Engine>, data_dir: &Path, port: u16) 
     let token = crate::new_token();
     let running = crate::serve(engine.clone(), token.clone(), port).await?;
     let pairing = crate::pairing::serve(data_dir, running.addr.port(), token.clone()).await?;
-    Ok(Runtime { engine, port: running.addr.port(), token, _api: running.task, _pairing: pairing })
+    Ok(Runtime { engine, port: running.addr.port(), token, browser_sources: running.browser_sources, _api: running.task, _pairing: pairing })
 }
 
 pub const HOST_NAME: &str = "com.multicorder.host";

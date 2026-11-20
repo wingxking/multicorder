@@ -1,6 +1,18 @@
 import React from "react";
 
 // 16 px outline icons (stroke = currentColor), drawn for this UI.
+
+/** A cog with eight flat teeth around the centre (8, 8). */
+const GEAR = (() => {
+  const teeth = 8, outer = 6.4, inner = 4.9, half = Math.PI / teeth;
+  const point = (r: number, a: number) => `${(8 + r * Math.cos(a)).toFixed(2)} ${(8 + r * Math.sin(a)).toFixed(2)}`;
+  let d = "";
+  for (let i = 0; i < teeth; i++) {
+    const a = (i * 2 * Math.PI) / teeth;
+    d += `${i ? "L" : "M"}${point(inner, a - half * 0.62)}L${point(outer, a - half * 0.38)}L${point(outer, a + half * 0.38)}L${point(inner, a + half * 0.62)}`;
+  }
+  return `${d}Z`;
+})();
 const paths: Record<string, React.ReactNode> = {
   record: <circle cx="8" cy="8" r="4.5" fill="currentColor" stroke="none" />,
   stop: <rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor" stroke="none" />,
@@ -14,7 +26,9 @@ const paths: Record<string, React.ReactNode> = {
   sun: <><circle cx="8" cy="8" r="3" /><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1 1M11.6 11.6l1 1M3.4 12.6l1-1M11.6 4.4l1-1" /></>,
   moon: <path d="M13 9.5A5.5 5.5 0 016.5 3a5.5 5.5 0 106.5 6.5z" />,
   monitor: <><rect x="2" y="3" width="12" height="8" rx="1.5" /><path d="M6 14h4M8 11v3" /></>,
-  gear: <><circle cx="8" cy="8" r="2" /><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M3.6 12.4l1.1-1.1M11.3 4.7l1.1-1.1" /></>,
+  contrast: <><circle cx="8" cy="8" r="5.5" /><path d="M8 2.5a5.5 5.5 0 010 11z" fill="currentColor" stroke="none" /></>,
+  globe: <><circle cx="8" cy="8" r="5.75" /><ellipse cx="8" cy="8" rx="2.4" ry="5.75" /><path d="M2.5 6.2h11M2.5 9.8h11" /></>,
+  gear: <><path d={GEAR} /><circle cx="8" cy="8" r="2" /></>,
   library: <><path d="M3 2.5v11M6 2.5v11" /><path d="M9 3l3.5 10" /></>,
   search: <><circle cx="7" cy="7" r="4.5" /><path d="M10.5 10.5 14 14" /></>,
   edit: <path d="M9.5 4.5l2 2M3 13l.6-3.6 7-7a1.4 1.4 0 012 0l1 1a1.4 1.4 0 010 2l-7 7L3 13z" />,
@@ -32,6 +46,11 @@ const paths: Record<string, React.ReactNode> = {
   scissors: <><circle cx="4.5" cy="4.5" r="2" /><circle cx="4.5" cy="11.5" r="2" /><path d="M6.2 5.6 13.5 12M6.2 10.4 13.5 4" /></>,
   sparkle: <path d="M8 2.5 9.2 6.8 13.5 8l-4.3 1.2L8 13.5 6.8 9.2 2.5 8l4.3-1.2z" />,
   text: <path d="M3 4h10M3 7h10M3 10h7M3 13h5" />,
+  skipBack: <><path d="M3.2 8a4.8 4.8 0 104.8-4.8H5.5" /><path d="M7 1.6 5.4 3.2 7 4.8" /></>,
+  skipForward: <><path d="M12.8 8A4.8 4.8 0 118 3.2h2.5" /><path d="M9 1.6l1.6 1.6L9 4.8" /></>,
+  mute: <><path d="M2.5 6h2.5L8.5 3v10L5 10H2.5z" /><path d="M11 6l3.5 4M14.5 6 11 10" /></>,
+  more: <><circle cx="3.5" cy="8" r=".9" fill="currentColor" /><circle cx="8" cy="8" r=".9" fill="currentColor" /><circle cx="12.5" cy="8" r=".9" fill="currentColor" /></>,
+  sliders: <><path d="M3 4.5h10M3 11.5h10" /><circle cx="6" cy="4.5" r="1.6" fill="var(--surface, #fff)" /><circle cx="10.5" cy="11.5" r="1.6" fill="var(--surface, #fff)" /></>,
 };
 
 export function Icon({ name, size = 16, title }: { name: keyof typeof paths | string; size?: number; title?: string }) {

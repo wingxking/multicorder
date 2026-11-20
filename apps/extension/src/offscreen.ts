@@ -51,7 +51,7 @@ class IngestPipe {
     ws.onopen = () => {
       this.connected = true;
       this.backoff = 500;
-      ws.send(JSON.stringify({ t: "hello", session_id: this.sessionId, resume_from: this.acked + 1, ext_version: chrome.runtime.getManifest().version }));
+      ws.send(JSON.stringify({ t: "hello", session_id: this.sessionId, resume_from: this.acked + 1 }));
     };
     ws.onmessage = (m) => {
       if (typeof m.data !== "string") return;

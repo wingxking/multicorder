@@ -761,6 +761,15 @@ tabCapture 流 ──┬─▶ 回放（可静默）
 | `cloud` | `https://multicoder.followkol.live`（可改） | 设置页填写的访问令牌 | 云端服务上线后切换。接口与本机服务相同 |
 | `custom` | 用户自己的 MOSS 或 OpenAI 兼容地址 | 存在浏览器里的密钥 | 第 5.11 节原有方式 |
 
+**Mac App 自己用哪个转写和总结**（`config.json` 的 `service`，设置页“转写与总结”）：
+
+| `service.mode` | 行为 |
+|---|---|
+| `service` | 调用 Multicorder 服务：`env` 为 `cloud` 时是 `multicoder.followkol.live`，为 `local` 时是 `local_url`（另一台运行中的服务，不能指向本 App 自己的端口） |
+| `custom` | 用 `asr` 和 `llm` 里配置的供应商和密钥直接调用（当前用 MOSS：转写 `moss-transcribe-diarize-pro`，总结 `nex-n2.6`） |
+
+新装的 App 没有 `service` 项、也没有密钥时按 `service`＋`cloud` 处理。**云端上线之前，这个默认值转写不了**：每段音频都会记入 `asr_failures`（错误为“无法连接 Multicorder 服务”），录音不受影响。2026-11-20 的本机实测就是这个原因；在设置页改为“自有密钥”并填入 MOSS 密钥后，补转循环自动补齐了之前失败的 31 段。插件选“本机”时调用的是 App 的 `/v1/asr/transcribe`，所以同样取决于这里的设置。
+
 **服务接口**（本机服务和云端服务实现同一套，令牌放在 `Authorization: Bearer`）：
 
 | 接口 | 请求 | 回复 |

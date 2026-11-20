@@ -41,6 +41,91 @@ pub fn from_config(cfg: &AsrConfig) -> anyhow::Result<Arc<dyn AsrAdapter>> {
     }
 }
 
+/// Transcription through the Multicorder service API (`POST /v1/asr/transcribe`, WAV body).
+pub struct ServiceAsr {
+    endpoint: String,
+    token: String,
+    label: String,
+    client: reqwest::Client,
+}
+
+impl ServiceAsr {
+    pub fn new(base_url: &str, token: &str, label: &str) -> Self {
+        Self {
+            endpoint: format!("{}/v1/asr/transcribe", base_url.trim_end_matches('/')),
+            token: token.trim().to_string(),
+            label: label.to_string(),
+            client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build().unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ServiceTranscript {
+    #[serde(default)]
+    segments: Vec<ServiceSegment>,
+}
+
+#[derive(Deserialize)]
+struct ServiceSegment {
+    start_ms: i64,
+    end_ms: i64,
+    text: String,
+}
+
+#[async_trait]
+impl AsrAdapter for ServiceAsr {
+    fn id(&self) -> String {
+        format!("service:{}", self.label)
+    }
+
+    /// Billed by the service, not against this Mac's daily cap.
+    fn usd_per_minute(&self) -> f64 {
+        0.0
+    }
+
+    async fn transcribe(&self, pcm16k: &[f32], lang: Option<&str>) -> anyhow::Result<Vec<AsrSegment>> {
+        let wav = mc_audio::encode_wav(pcm16k)?;
+        let duration_ms = mc_core::samples_to_ms(pcm16k.len());
+        let lang = lang.filter(|l| !l.is_empty());
+        let mut attempt = 0;
+        let resp = loop {
+            let mut request = self.client.post(&self.endpoint).header("Content-Type", "audio/wav").body(wav.clone());
+            if let Some(l) = lang {
+                request = request.query(&[("lang", l)]);
+            }
+            if !self.token.is_empty() {
+                request = request.bearer_auth(&self.token);
+            }
+            match request.send().await {
+                Ok(resp) if resp.status().is_success() => break resp,
+                Ok(resp) if (resp.status().as_u16() == 429 || resp.status().is_server_error()) && attempt < 2 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body: String = resp.text().await.unwrap_or_default().chars().take(300).collect();
+                    anyhow::bail!("Multicorder service HTTP {status}: {body}");
+                }
+                Err(e) if attempt < 2 => {
+                    attempt += 1;
+                    tracing::warn!(error = %e, "service ASR request failed, retrying");
+                    tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
+                }
+                Err(e) => anyhow::bail!("Multicorder service is not reachable: {e}"),
+            }
+        };
+        let body: ServiceTranscript = resp.json().await?;
+        Ok(body
+            .segments
+            .into_iter()
+            .filter(|s| !s.text.trim().is_empty() && s.end_ms > s.start_ms)
+            .map(|s| AsrSegment { start_ms: s.start_ms.max(0), end_ms: s.end_ms.min(duration_ms.max(1)), text: s.text.trim().to_string(), lang: lang.map(str::to_string) })
+            .collect())
+    }
+}
+
 pub struct HttpAsr {
     endpoint: String,
     key: String,

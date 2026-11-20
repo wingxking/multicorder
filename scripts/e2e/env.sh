@@ -1,5 +1,6 @@
 # Shared settings for the end-to-end tests. Keys are read from an env file outside the repo
-# (default: the Catchup project's media/.env) and only exported to child processes.
+# (default: the Catchup project's media/.env) and only exported to child processes. MOSS does both
+# transcription (moss-transcribe-diarize-pro) and summaries (nex-n2.6); there is no fallback model.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="$ROOT/test-output"
@@ -13,12 +14,11 @@ EXT_ID="ileogemoijmhcnkcbanfaiolhdhoffbj"
 write_config() {
   cat > "$MC_DATA_DIR/config.json" <<JSON
 {
+  "service": {"mode": "custom"},
   "asr": {"provider": "moss", "protocol": "moss", "base_url": "https://api.mosi.cn/v1", "model": "moss-transcribe-diarize-pro",
           "api_key_env": "MOSS_API_KEY", "timestamps": "segment", "usd_per_minute": 0.005, "concurrency": 3},
-  "llm": {"use": "moss", "fallback": ["zhipu", "deepseek"], "providers": {
-    "moss": {"base_url": "https://api.mosi.cn/v1", "api_key_env": "MOSS_API_KEY", "model": "nex-n2.6", "prices": [0.55, 0.55, 2.8]},
-    "zhipu": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "api_key_env": "ZHIPU_LLM_KEY", "model": "glm-4.7-flash", "extra": {"thinking": {"type": "disabled"}}, "prices": [0, 0, 0]},
-    "deepseek": {"base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_LLM_KEY", "model": "deepseek-flash", "extra": {"thinking": {"type": "disabled"}}, "prices": [0.3, 0.006, 1.2]}
+  "llm": {"use": "moss", "fallback": [], "providers": {
+    "moss": {"base_url": "https://api.mosi.cn/v1", "api_key_env": "MOSS_API_KEY", "model": "nex-n2.6", "prices": [4.0, 4.0, 20.0]}
   }},
   "output_lang": "zh",
   "allowed_extension_ids": ["$EXT_ID"],

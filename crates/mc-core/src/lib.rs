@@ -170,6 +170,14 @@ pub enum SourceSpec {
     },
 }
 
+/// A Chrome tab belongs to one browser profile for the lifetime of that browser session.
+pub fn chromium_source_id(browser: Option<&str>, tab: i64, client: Option<&str>) -> String {
+    match client {
+        Some(client) => serde_json::json!([browser, client, tab]).to_string(),
+        None => serde_json::json!([browser, tab]).to_string(),
+    }
+}
+
 impl SourceSpec {
     pub fn kind(&self) -> SourceKind {
         match self {

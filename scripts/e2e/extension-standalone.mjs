@@ -24,7 +24,6 @@ try {
       asr: { provider: "moss", protocol: "moss", baseUrl: "https://api.mosi.cn/v1", model: "moss-transcribe-diarize-pro", apiKey: process.env.MOSS_API_KEY, segmented: true, language: "", usdPerMinute: 0.005 },
       llm: [
         { name: "moss", baseUrl: "https://api.mosi.cn/v1", model: "nex-n2.6", apiKey: process.env.MOSS_API_KEY },
-        { name: "deepseek", baseUrl: "https://api.deepseek.com", model: "deepseek-flash", apiKey: process.env.DEEPSEEK_LLM_KEY || "", extra: { thinking: { type: "disabled" } } },
       ],
     }),
   );

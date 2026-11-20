@@ -4,3 +4,4 @@ export * from "./theme";
 export * from "./icons";
 export * from "./i18n";
 export * from "./ThemeToggle";
+export * from "./title";

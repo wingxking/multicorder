@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Who transcribes and summarizes: the Multicorder service, or providers with the user's keys.
+    #[serde(default)]
+    pub service: ServiceConfig,
     #[serde(default)]
     pub asr: AsrConfig,
     #[serde(default)]
@@ -33,12 +36,62 @@ fn default_cap() -> f64 {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            service: ServiceConfig::default(),
             asr: AsrConfig::default(),
             llm: LlmConfig::default(),
             output_lang: default_output_lang(),
             allowed_extension_ids: vec![],
             daily_usd_cap: default_cap(),
         }
+    }
+}
+
+pub const CLOUD_SERVICE_URL: &str = "https://multicoder.followkol.live";
+pub const LOCAL_SERVICE_URL: &str = "http://127.0.0.1:8787";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServiceConfig {
+    /// `service`: the Multicorder API (`/v1/asr/transcribe`, `/v1/llm/chat`) does the work.
+    /// `custom`: `asr` and `llm` providers are called directly with the user's keys.
+    #[serde(default = "default_service_mode")]
+    pub mode: String,
+    /// Developer option: `cloud` (the online service) or `local` (a service on this network).
+    #[serde(default = "default_service_env")]
+    pub env: String,
+    /// URL prefix of the local development service.
+    #[serde(default = "default_local_url")]
+    pub local_url: String,
+    /// Bearer token for the service, when it asks for one.
+    #[serde(default)]
+    pub token: String,
+}
+
+fn default_service_mode() -> String {
+    "service".into()
+}
+fn default_service_env() -> String {
+    "cloud".into()
+}
+fn default_local_url() -> String {
+    LOCAL_SERVICE_URL.into()
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self { mode: default_service_mode(), env: default_service_env(), local_url: default_local_url(), token: String::new() }
+    }
+}
+
+impl ServiceConfig {
+    pub fn uses_service(&self) -> bool {
+        self.mode != "custom"
+    }
+
+    /// The service address without a trailing slash or `/v1`.
+    pub fn base_url(&self) -> String {
+        let url = if self.env == "local" { self.local_url.trim() } else { CLOUD_SERVICE_URL };
+        let url = url.trim_end_matches('/');
+        url.strip_suffix("/v1").unwrap_or(url).to_string()
     }
 }
 
@@ -176,7 +229,24 @@ impl Config {
             set_private(&path);
             return Ok(config);
         }
-        Ok(serde_json::from_slice(&std::fs::read(&path)?)?)
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let mut config: Self = serde_json::from_value(raw.clone())?;
+        // Files from before the service existed keep calling the providers whose keys they hold.
+        if raw.get("service").is_none() && (!config.asr.key().is_empty() || config.llm.providers.values().any(|p| !p.key().is_empty())) {
+            config.service.mode = "custom".into();
+        }
+        Ok(config)
+    }
+
+    /// Writes `config.json` in `dir` with owner-only permissions.
+    pub fn save(&self, dir: &Path) -> anyhow::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join("config.json");
+        let tmp = dir.join("config.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        set_private(&tmp);
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
     }
 }
 
@@ -198,6 +268,34 @@ mod tests {
         std::env::set_var("MC_TEST_KEY_X", " from-env ");
         assert_eq!(resolve_key("MC_TEST_KEY_X", "from-file"), "from-env");
         assert_eq!(resolve_key("MC_TEST_KEY_MISSING", "from-file"), "from-file");
+    }
+
+    #[test]
+    fn old_files_with_keys_stay_on_their_providers() {
+        let dir = std::env::temp_dir().join(format!("mc-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut old = serde_json::to_value(Config::default()).unwrap();
+        old.as_object_mut().unwrap().remove("service");
+        old["asr"]["api_key"] = "k".into();
+        old["asr"]["api_key_env"] = "".into();
+        old["llm"]["providers"]["moss"]["api_key_env"] = "".into();
+        std::fs::write(dir.join("config.json"), old.to_string()).unwrap();
+        assert_eq!(Config::load_or_init(&dir).unwrap().service.mode, "custom");
+        old["asr"]["api_key"] = "".into();
+        std::fs::write(dir.join("config.json"), old.to_string()).unwrap();
+        let fresh = Config::load_or_init(&dir).unwrap();
+        assert!(fresh.service.uses_service());
+        fresh.save(&dir).unwrap();
+        assert_eq!(Config::load_or_init(&dir).unwrap().service, fresh.service);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn service_url_drops_suffixes() {
+        let mut s = ServiceConfig { env: "local".into(), local_url: "http://127.0.0.1:9000/v1/".into(), ..Default::default() };
+        assert_eq!(s.base_url(), "http://127.0.0.1:9000");
+        s.env = "cloud".into();
+        assert_eq!(s.base_url(), CLOUD_SERVICE_URL);
     }
 
     #[test]

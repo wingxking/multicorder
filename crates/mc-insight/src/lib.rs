@@ -13,7 +13,7 @@ use mc_store::Store;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-pub use llm::{HttpLlm, Llm, Usage};
+pub use llm::{HttpLlm, Llm, ServiceLlm, Usage};
 
 const KINDS: &[&str] = &["key_point", "claim", "number", "decision", "question", "action", "quote", "topic"];
 

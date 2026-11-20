@@ -61,6 +61,10 @@ impl SegmentWriter {
         self.write_current().map(Some)
     }
 
+    pub fn buffered_audio(&self) -> &[f32] {
+        &self.buf
+    }
+
     pub fn buffered_samples(&self) -> usize {
         self.buf.len()
     }

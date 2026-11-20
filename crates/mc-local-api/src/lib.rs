@@ -3,6 +3,8 @@
 //! `chrome-extension://…` (web pages are rejected).
 
 mod ws;
+mod browser_sources;
+pub use browser_sources::BrowserSources;
 pub mod pairing;
 pub mod runtime;
 
@@ -36,6 +38,7 @@ pub struct ApiState {
     pub engine: Arc<Engine>,
     pub token: Arc<String>,
     tickets: Arc<Mutex<HashMap<String, Instant>>>,
+    browser_sources: Arc<BrowserSources>,
 }
 
 pub fn new_token() -> String {
@@ -47,11 +50,13 @@ pub struct Running {
     pub addr: SocketAddr,
     pub token: String,
     pub task: tokio::task::JoinHandle<()>,
+    pub browser_sources: Arc<BrowserSources>,
 }
 
 /// Binds 127.0.0.1:`port` (0 = random) and serves until the task is dropped.
 pub async fn serve(engine: Arc<Engine>, token: String, port: u16) -> anyhow::Result<Running> {
-    let state = ApiState { engine, token: Arc::new(token.clone()), tickets: Default::default() };
+    let browser_sources = Arc::new(BrowserSources::default());
+    let state = ApiState { engine, token: Arc::new(token.clone()), tickets: Default::default(), browser_sources: browser_sources.clone() };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
@@ -61,13 +66,14 @@ pub async fn serve(engine: Arc<Engine>, token: String, port: u16) -> anyhow::Res
         }
     });
     tracing::info!(%addr, "local api listening");
-    Ok(Running { addr, token, task })
+    Ok(Running { addr, token, task, browser_sources })
 }
 
 pub fn router(state: ApiState) -> Router {
     let api = Router::new()
         .route("/v1/status", get(status))
         .route("/v1/apps", get(apps))
+        .route("/v1/browser-sources", get(browser_sources::upgrade))
         .route("/v1/sse-ticket", post(sse_ticket))
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/sessions/{id}", get(get_session).patch(patch_session).delete(delete_session))
@@ -212,10 +218,11 @@ struct CreateSession {
     force: bool,
     #[serde(default)]
     wait_for_audio: bool,
+    browser_client_id: Option<String>,
 }
 
 async fn create_session(State(s): State<ApiState>, Json(body): Json<CreateSession>) -> ApiResult<Json<serde_json::Value>> {
-    let options = StartOptions { force: body.force, wait_for_audio: body.wait_for_audio, ..StartOptions::default() };
+    let options = StartOptions { force: body.force, wait_for_audio: body.wait_for_audio, browser_client_id: body.browser_client_id, ..StartOptions::default() };
     let (row, warnings) = s.engine.start_session_opts(body.source, body.summary_mode.unwrap_or_default(), body.title, options)?;
     Ok(Json(json!({"session": row, "ingest_path": format!("/v1/ingest/{}", row.id), "warnings": warnings})))
 }

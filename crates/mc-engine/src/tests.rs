@@ -130,7 +130,14 @@ async fn paused_audio_is_skipped_and_audio_only_can_be_transcribed_and_summarize
     for (i, frame) in tone(880.0, 1.0).chunks(1600).enumerate() {
         engine.ingest_tab_frame(&session.id, 10 + i as u32, 0.0, frame).unwrap();
     }
+    let snapshot = engine.paused_audio_wav(&session.id).await.unwrap();
+    let snapshot = mc_audio::decode_wav_to_16k(&snapshot).unwrap();
+    assert_eq!(snapshot.len(), sound.len());
+    assert!(snapshot.iter().zip(&sound).all(|(actual, expected)|
+        (*actual - mc_audio::i16_to_f32(*expected)).abs() < 0.0001));
+    assert!(engine.store.segments(&session.id).unwrap().is_empty());
     engine.set_paused(&session.id, false).unwrap();
+    assert!(engine.paused_audio_wav(&session.id).await.is_err());
     for (i, frame) in sound.chunks(1600).enumerate() {
         engine.ingest_tab_frame(&session.id, 20 + i as u32, 0.0, frame).unwrap();
     }

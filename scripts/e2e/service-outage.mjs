@@ -108,7 +108,9 @@ try {
   const rd2 = await until(() => readSession(panel, d.sessionId), doneExt, 180_000, "D filled automatically");
   result.steps.d_filled_after_s = Math.round((Date.now() - t0) / 1000);
   await until(() => api(p, `/v1/sessions/${macId}`), (s) => s.asr?.failed_chunks === 0, 180_000, "Mac session filled");
-  await until(() => api(p, `/v1/sessions/${macId}/report`).catch(() => null), (r) => !!r?.body, 120_000, "Mac report");
+  // The report written during the outage says no speech was transcribed; wait for the regenerated one.
+  await until(() => api(p, `/v1/sessions/${macId}/report`).catch(() => null), (r) => !!r?.body && !r.body.includes("No speech was transcribed"), 180_000, "Mac report regenerated");
+  await until(() => api(p, `/v1/sessions/${macId}/insights`).catch(() => []), (i) => i.length > 0, 60_000, "Mac key points");
   result.steps.mac_filled_after_s = Math.round((Date.now() - t0) / 1000);
   result.results.push(check(rc2, "falcon", "斑马", "C-3 recovered by Retry button (C)"), check(rd2, "斑马", "falcon", "C-3 recovered automatically (D)"));
   result.results.push(await verify(p, macId, { expect: "falcon", forbid: "斑马", label: "C-3 Mac engine recovered automatically" }));

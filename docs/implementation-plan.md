@@ -112,3 +112,22 @@
 | C-4 | 云端不可达时的提示 | 端到端：选择云端后侧边栏显示不可达，录音照常，文字等待补转 |
 | C-5 | 界面：共享主题、图标、主题切换；侧边栏、资料库、设置页、桌面 App 重做 | 截图检查浅色和深色 |
 | D-1 | 两个 App 和两个 Tab 同时录音 | 端到端：Multicorder.app 用进程 tap 录两个 App，插件独立录两个 Tab 并以同一个 App 为转写服务，四路零串音 |
+
+### MVP-1.2 测试结果（2026-11-20，全部用 Catchup 项目的 MOSS 密钥：转写 `moss-transcribe-diarize-pro`，总结 `nex-n2.6`，不用备用模型）
+
+**先查到的问题：** 用户反映 App 好像没有转写。原因有两个：
+
+1. 安装的 App 的 `config.json` 没有 `service` 项，也没有保存密钥，于是默认用 Multicorder 云端服务；云端尚未部署，31 段转写都失败了（“无法连接 Multicorder 服务”）。已在 App 的配置里改为“自有密钥”，并填入 MOSS 密钥；重启后补转循环自动补齐了这 31 段，三条录音都有了文字、要点和报告。
+2. 桌面界面新开的录音默认是“仅录音”（`off`），这种模式完全不转写，与“转写默认开启”的要求不符。已改为“实时”（`apps/desktop/src/main.tsx` 的 `NEW_RECORDING_MODE`）。安装的 App 还没有换成新版本。
+
+| 验收 | 结果 | 证据 |
+|---|---|---|
+| 单元测试 | ✅ Rust 56 项通过，clippy 无警告；插件 18 项通过（补上了 3 条服务错误的中文翻译）；两端类型检查通过 | `cargo test --workspace`、`pnpm --filter @multicorder/extension test` |
+| 回归 | ✅ 两路 WS、连接模式的插件、防重复录制、独立模式（插件自带 MOSS 密钥） | `test-output/e2e-ws.json` 等 |
+| C-1 本机服务 | ✅ 插件不存密钥，两路同时录制，通过本机服务转写、生成要点和报告；零串音；录音只存在浏览器里 | `test-output/e2e-service-outage.json` |
+| C-2 转写故障 | ✅ 服务的 MOSS 密钥失效时：插件两路和 Mac 引擎一路录音完整；文字缺失有提示和“重试”；服务没恢复时重试会报告仍有待补；Mac 端录音可以导出为 WAV | 同上，截图 `test-output/ui-sidepanel-outage-light.png` |
+| C-3 恢复 | ✅ 密钥恢复后：点卡片的“重试”14 秒补齐；另一路 36 秒、Mac 引擎一路 38 秒自动补齐；要点和报告重新生成 | 同上 |
+| C-4 云端不可达 | ✅ 侧边栏显示 `multicoder.followkol.live is not reachable`，录音照常，文字等待补转 | 同上 |
+| D-1 两个 App 加两个 Tab | ✅ 用已安装的 Multicorder.app：两个 `afplay` 各用一个进程 tap，插件同时独立录两个 Tab 并以这个 App 为转写服务；四路同时进行，各自只有自己的内容（Falcon、斑马、Orchid、长颈鹿），转写引擎都是 `moss:moss-transcribe-diarize-pro`，报告模型是 `moss:nex-n2.6`。测试录音结束后已从 App 中删除 | `test-output/e2e-multi-source.json` |
+
+**测试脚本的修正：** 故障恢复的检查原来会读到故障期间生成的“没有转写到语音”的旧报告，现在等待重新生成的报告和要点。

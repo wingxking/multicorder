@@ -51,6 +51,7 @@ pub struct StartOptions {
     pub wait_for_audio: bool,
     pub mute_playback: bool,
     pub format: mc_core::RecordingFormat,
+    pub browser_client_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +82,29 @@ impl AsrAdapter for Unconfigured {
     }
 }
 
+/// The transcription adapter `config` asks for: the Multicorder service or the user's provider.
+fn asr_from(config: &Config) -> Arc<dyn AsrAdapter> {
+    if config.service.uses_service() {
+        let base = config.service.base_url();
+        if base.is_empty() {
+            return Arc::new(Unconfigured("No Multicorder service address is set".into()));
+        }
+        return Arc::new(mc_asr::ServiceAsr::new(&base, &config.service.token, &config.service.env));
+    }
+    match mc_asr::from_config(&config.asr) {
+        Ok(adapter) => adapter,
+        Err(e) => Arc::new(Unconfigured(e.to_string())),
+    }
+}
+
+fn llm_from(config: &Config) -> Option<Arc<dyn Llm>> {
+    if config.service.uses_service() {
+        let base = config.service.base_url();
+        return (!base.is_empty()).then(|| mc_insight::ServiceLlm::new(&base, &config.service.token).ok().map(|l| Arc::new(l) as Arc<dyn Llm>)).flatten();
+    }
+    mc_insight::HttpLlm::from_config(&config.llm).ok().map(|l| Arc::new(l) as Arc<dyn Llm>)
+}
+
 impl Engine {
     /// Opens the data folder, recovers interrupted sessions and starts the schedulers.
     /// Must run inside a tokio runtime.
@@ -98,11 +122,8 @@ impl Engine {
         for id in &recovered {
             mc_recorder::clean_partial(&data_dir.join("audio").join(id));
         }
-        let asr = asr.unwrap_or_else(|| match mc_asr::from_config(&config.asr) {
-            Ok(a) => a,
-            Err(e) => Arc::new(Unconfigured(e.to_string())),
-        });
-        let llm = llm.or_else(|| mc_insight::HttpLlm::from_config(&config.llm).ok().map(|l| Arc::new(l) as Arc<dyn Llm>));
+        let asr = asr.unwrap_or_else(|| asr_from(&config));
+        let llm = llm.or_else(|| llm_from(&config));
         let (events, _) = broadcast::channel(4096);
         let engine = Arc::new(Self {
             store,
@@ -122,6 +143,19 @@ impl Engine {
 
     pub fn config(&self) -> Config {
         self.config.read().unwrap().clone()
+    }
+
+    /// Saves a changed `config.json` and switches transcription and summaries to it at once.
+    /// Chunks already queued use the new adapter when their turn comes.
+    pub fn update_config(&self, change: impl FnOnce(&mut Config)) -> anyhow::Result<Config> {
+        let mut next = self.config();
+        change(&mut next);
+        next.save(&self.data_dir)?;
+        self.asr.set_adapter(asr_from(&next));
+        *self.llm.write().unwrap() = llm_from(&next);
+        *self.config.write().unwrap() = next.clone();
+        self.retry_notify.notify_one();
+        Ok(next)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
@@ -260,7 +294,7 @@ impl Engine {
         let (title, bundle, url, video_key, capture_source_id, browser) = match &spec {
             SourceSpec::ChromiumTab { tab_id, url, title: t, browser } => {
                 let vk = url.as_deref().and_then(video_key_of);
-                let identity = tab_id.map(|id| serde_json::json!([browser, id]).to_string());
+                let identity = tab_id.map(|id| mc_core::chromium_source_id(browser.as_deref(), id, options.browser_client_id.as_deref()));
                 (title.or(t.clone()).unwrap_or_else(|| "Browser tab".into()), browser.clone(), url.clone(), vk, identity, browser.clone())
             }
             SourceSpec::MacApp { app_id } => {
@@ -501,6 +535,15 @@ impl Engine {
         let (out, u) = llm.chat_json(system, user, max_tokens.min(4000)).await?;
         let _ = self.store.add_usage(None, &format!("{}:{}", u.provider, u.model), "tokens", (u.input_tokens + u.output_tokens) as f64, u.usd);
         Ok((out, u.provider, u.model, u.input_tokens + u.output_tokens))
+    }
+
+    /// Reads the committed FLAC segments and the current buffer at a paused capture boundary.
+    pub async fn paused_audio_wav(&self, id: &str) -> anyhow::Result<Vec<u8>> {
+        let handle = self.handle(id)?;
+        let (reply, audio) = tokio::sync::oneshot::channel();
+        handle.tx.try_send(SessionMsg::Preview(reply)).map_err(|error| anyhow::anyhow!("Could not review this recording: {error}"))?;
+        let snapshot = audio.await??;
+        tokio::task::spawn_blocking(move || snapshot.wav()).await?
     }
 
     /// The archived audio of a session at its original rate and bit depth.

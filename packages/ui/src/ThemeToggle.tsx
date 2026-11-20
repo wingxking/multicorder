@@ -5,7 +5,7 @@ import { saveThemePref, ThemePref, useThemePref } from "./theme";
 
 const NEXT: Record<ThemePref, ThemePref> = { system: "light", light: "dark", dark: "system" };
 const LABEL: Record<ThemePref, string> = { system: "Theme: follow system", light: "Theme: light", dark: "Theme: dark" };
-const ICON: Record<ThemePref, string> = { system: "monitor", light: "sun", dark: "moon" };
+const ICON: Record<ThemePref, string> = { system: "contrast", light: "sun", dark: "moon" };
 
 /** Cycles system → light → dark. `persist` lets the extension mirror the choice to chrome.storage. */
 export function ThemeToggle({ persist }: { persist?: (p: ThemePref) => void }) {
@@ -36,8 +36,8 @@ export function LangToggle() {
   const next = LANGUAGES[(i + 1) % LANGUAGES.length];
   const label = t("Switch to {language}", { language: next.label });
   return (
-    <button className="btn btn-ghost text-btn" title={label} aria-label={label} onClick={() => setLangPref(next.code)}>
-      {next.short}
+    <button className="btn btn-ghost icon-btn" title={label} aria-label={label} onClick={() => setLangPref(next.code)}>
+      <Icon name="globe" />
     </button>
   );
 }

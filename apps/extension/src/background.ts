@@ -1,6 +1,7 @@
 // Service worker: entry points, backend choice (standalone or the Mac app), pairing,
 // getMediaStreamId, routing. It keeps no state of its own (design 5.2–5.3, 5.11).
 
+import { browserClientId, clearDesktopIntent, desktopIntent, DesktopPairing, recordingLabel, startDesktopSourceSync } from "./browser-sources";
 import * as db from "./local/db";
 import type { Target } from "./local/providers";
 import { loadSettings, Settings } from "./local/settings";
@@ -8,11 +9,7 @@ import { isWhitelisted, OffscreenMsg, OffscreenSession } from "./protocol";
 
 const HOST = "com.multicorder.host";
 
-interface Pairing {
-  port: number;
-  token: string;
-  browser?: string | null;
-}
+type Pairing = DesktopPairing;
 
 async function nativeAsk(msg: object): Promise<any> {
   return chrome.runtime.sendNativeMessage(HOST, msg);
@@ -20,7 +17,7 @@ async function nativeAsk(msg: object): Promise<any> {
 
 async function healthy(p: Pairing): Promise<boolean> {
   try {
-    const r = await fetch(`http://127.0.0.1:${p.port}/v1/status`, { headers: { Authorization: `Bearer ${p.token}` } });
+    const r = await fetch(`http://127.0.0.1:${p.port}/v1/status`, { headers: { Authorization: `Bearer ${p.token}` }, signal: AbortSignal.timeout(3000) });
     return r.ok;
   } catch {
     return false;
@@ -48,6 +45,8 @@ async function ensurePaired(launch: boolean): Promise<Pairing | null> {
   await chrome.storage.session.remove("pairing");
   return null;
 }
+
+startDesktopSourceSync(() => ensurePaired(false));
 
 /** Which backend a new recording uses: the in-browser engine (default) or the Mac app. */
 async function chooseBackend(): Promise<{ backend: "local" | "app"; pairing: Pairing | null } | null> {
@@ -142,7 +141,7 @@ async function createAppSession(p: Pairing, tab: { id?: number; url?: string; ti
   const res = await fetch(`http://127.0.0.1:${p.port}/v1/sessions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${p.token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ source: { kind: "chromium_tab", tab_id: tab.id, url: tab.url, title: tab.title, browser: p.browser ?? null }, summary_mode: mode, wait_for_audio: waitForAudio }),
+    body: JSON.stringify({ source: { kind: "chromium_tab", tab_id: tab.id, url: tab.url, title: tab.title, browser: p.browser ?? null }, summary_mode: mode, wait_for_audio: waitForAudio, browser_client_id: await browserClientId() }),
   });
   const body = await res.json();
   if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
@@ -169,7 +168,10 @@ async function startOrOpen(tab: chrome.tabs.Tab | undefined) {
   if (!tab?.id) return;
   chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
   if ((await tabsMap())[tab.id]) return;
-  const choice = await chooseBackend();
+  const request = await desktopIntent(tab.id);
+  const pairing = request ? await ensurePaired(false) : null;
+  if (request && !pairing) throw new Error("The local Mac service is not running");
+  const choice = pairing ? { backend: "app" as const, pairing } : await chooseBackend();
   if (!choice) {
     await chrome.tabs.create({ url: chrome.runtime.getURL("onboarding.html") });
     return;
@@ -178,20 +180,22 @@ async function startOrOpen(tab: chrome.tabs.Tab | undefined) {
   const already = await new Promise<chrome.tabCapture.CaptureInfo[]>((r) => chrome.tabCapture.getCapturedTabs(r));
   if (already.some((t) => t.tabId === tab.id && t.status !== "stopped" && t.status !== "error")) return;
   await ensureOffscreen();
+  const title = await recordingLabel(tab);
   // The stream id is single-use and expires within seconds: get it last, then use it at once.
   const streamId = await new Promise<string>((resolve, reject) =>
     chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id }, (id) => (id ? resolve(id) : reject(new Error(chrome.runtime.lastError?.message || "no stream id")))),
   );
   const waitForAudio = !tab.audible || Boolean(tab.mutedInfo?.muted);
-  const common = { tabId: tab.id, title: tab.title, url: tab.url, mode: settings.defaultMode, muted: settings.silentCapture, waitForAudio, settings };
+  const common = { tabId: tab.id, title, url: tab.url, mode: request?.mode ?? settings.defaultMode, muted: request?.mute_playback ?? settings.silentCapture, waitForAudio, settings };
   const p = choice.pairing;
-  const id = p ? await createAppSession(p, tab, settings.defaultMode, waitForAudio) : undefined;
+  const id = p ? await createAppSession(p, { ...tab, title }, common.mode, waitForAudio) : undefined;
   try {
     const result = await toOffscreen<{ sessionId?: string; error?: string }>({
       target: "offscreen", type: "start", streamId, backend: choice.backend, sessionId: id, port: p?.port, token: p?.token, ...common,
     });
     if (!result?.sessionId) throw new Error(result?.error ?? "Could not start tab capture");
     await setTab(tab.id, { sessionId: result.sessionId, backend: choice.backend });
+    if (request) await clearDesktopIntent(tab.id);
   } catch (error) {
     if (p && id) {
       await fetch(`http://127.0.0.1:${p.port}/v1/sessions/${id}/stop`, { method: "POST", headers: { Authorization: `Bearer ${p.token}` } }).catch(() => {});
@@ -225,7 +229,9 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (!(await tabsMap())[tabId]) return;
-  if (info.url || info.title) await toOffscreen({ target: "offscreen", type: "navigation", tabId, url: tab.url, title: tab.title }).catch(() => {});
+  if (info.url || info.title || info.status === "complete") {
+    await toOffscreen({ target: "offscreen", type: "navigation", tabId, url: tab.url, title: await recordingLabel(tab) }).catch(() => {});
+  }
   if (info.status === "complete") await injectClock(tab);
 });
 

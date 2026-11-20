@@ -112,6 +112,65 @@ impl Llm for HttpLlm {
     }
 }
 
+/// Summaries through the Multicorder service API (`POST /v1/llm/chat`).
+pub struct ServiceLlm {
+    endpoint: String,
+    token: String,
+    client: reqwest::Client,
+}
+
+impl ServiceLlm {
+    pub fn new(base_url: &str, token: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            endpoint: format!("{}/v1/llm/chat", base_url.trim_end_matches('/')),
+            token: token.trim().to_string(),
+            client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(180)).build()?,
+        })
+    }
+}
+
+#[async_trait]
+impl Llm for ServiceLlm {
+    async fn chat_json(&self, system: &str, user: &str, max_tokens: u32) -> anyhow::Result<(Value, Usage)> {
+        let body = json!({"system": system, "user": user, "max_tokens": max_tokens});
+        let mut attempt = 0;
+        let resp: Value = loop {
+            let mut request = self.client.post(&self.endpoint).json(&body);
+            if !self.token.is_empty() {
+                request = request.bearer_auth(&self.token);
+            }
+            match request.send().await {
+                Ok(r) if r.status().is_success() => break r.json().await?,
+                Ok(r) if (r.status().as_u16() == 429 || r.status().is_server_error()) && attempt < 2 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * attempt)).await;
+                }
+                Ok(r) => {
+                    let status = r.status();
+                    let text: String = r.text().await.unwrap_or_default().chars().take(300).collect();
+                    anyhow::bail!("Multicorder service HTTP {status}: {text}");
+                }
+                Err(e) if attempt < 2 => {
+                    attempt += 1;
+                    tracing::warn!(error = %e, "service model request failed, retrying");
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * attempt)).await;
+                }
+                Err(e) => anyhow::bail!("Multicorder service is not reachable: {e}"),
+            }
+        };
+        let out = resp.get("out").cloned().filter(|v| !v.is_null()).ok_or_else(|| anyhow::anyhow!("Multicorder service returned no result"))?;
+        let usage = &resp["usage"];
+        // The service reports one token total; it bills on its side, so nothing is charged here.
+        Ok((out, Usage {
+            provider: usage["provider"].as_str().unwrap_or("service").to_string(),
+            model: usage["model"].as_str().unwrap_or_default().to_string(),
+            input_tokens: usage["tokens"].as_u64().unwrap_or(0),
+            output_tokens: 0,
+            usd: 0.0,
+        }))
+    }
+}
+
 /// Accepts plain JSON, fenced ```json blocks, or text around a single JSON object.
 pub fn parse_json_loose(s: &str) -> Option<Value> {
     let t = s.trim();

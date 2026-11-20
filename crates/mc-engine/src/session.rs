@@ -10,7 +10,7 @@ use mc_asr::Pass;
 use mc_core::{new_id, samples_to_ms, EngineEvent, RecordingFormat, SourceKind, SummaryMode, TranscriptEvent, SAMPLE_RATE};
 use mc_recorder::{SegmentInfo, SegmentWriter};
 use mc_vad::{Chunker, SpeechChunk};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::Engine;
 
@@ -24,6 +24,7 @@ pub enum SessionMsg {
     Audio(Vec<f32>),
     Mode(SummaryMode),
     Pause(bool),
+    Preview(oneshot::Sender<anyhow::Result<PausedAudio>>),
     Gap { start_ms: i64, end_ms: i64, cause: String },
     Status(String, Option<String>),
     Stop { reason: String },
@@ -246,16 +247,37 @@ pub fn spawn(engine: Arc<Engine>, id: String, kind: SourceKind, title: String, m
     Ok(handle)
 }
 
+pub struct PausedAudio {
+    segments: Vec<SegmentInfo>,
+    tail: Vec<f32>,
+    format: RecordingFormat,
+}
+
+impl PausedAudio {
+    pub fn wav(self) -> anyhow::Result<Vec<u8>> {
+        let (_, mut samples) = mc_recorder::read_archive(&self.segments, 0, None)?;
+        samples.extend(self.tail);
+        anyhow::ensure!(!samples.is_empty(), "No audio recorded yet");
+        mc_audio::encode_wav_with_format(&samples, self.format)
+    }
+}
+
+enum RecorderMsg {
+    Audio(Vec<f32>),
+    Preview(oneshot::Sender<anyhow::Result<PausedAudio>>),
+    Finish,
+}
+
 /// Archive writer on its own OS thread so FLAC encoding never stalls the session loop.
 struct RecorderThread {
-    tx: std::sync::mpsc::Sender<Option<Vec<f32>>>,
+    tx: std::sync::mpsc::Sender<RecorderMsg>,
     join: Option<std::thread::JoinHandle<Vec<SegmentInfo>>>,
 }
 
 impl RecorderThread {
     fn start(engine: Arc<Engine>, id: String, dir: &std::path::Path, format: RecordingFormat) -> anyhow::Result<Self> {
         let mut writer = SegmentWriter::new(dir, 0, 0, format)?;
-        let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<f32>>>();
+        let (tx, rx) = std::sync::mpsc::channel();
         let join = std::thread::Builder::new().name(format!("mc-rec-{id}")).spawn(move || {
             let mut all = Vec::new();
             let store = |segs: Vec<SegmentInfo>, all: &mut Vec<SegmentInfo>| {
@@ -266,13 +288,19 @@ impl RecorderThread {
                     all.push(s);
                 }
             };
-            while let Ok(Some(samples)) = rx.recv() {
-                match writer.push(&samples) {
-                    Ok(segs) => store(segs, &mut all),
-                    Err(e) => {
-                        tracing::error!(error = %e, "archive write failed");
-                        engine.emit(EngineEvent::Status { session_id: id.clone(), status: "capturing".into(), detail: Some(format!("storage_error: {e}")) });
+            while let Ok(message) = rx.recv() {
+                match message {
+                    RecorderMsg::Audio(samples) => match writer.push(&samples) {
+                        Ok(segs) => store(segs, &mut all),
+                        Err(e) => {
+                            tracing::error!(error = %e, "archive write failed");
+                            engine.emit(EngineEvent::Status { session_id: id.clone(), status: "capturing".into(), detail: Some(format!("storage_error: {e}")) });
+                        }
+                    },
+                    RecorderMsg::Preview(reply) => {
+                        let _ = reply.send(Ok(PausedAudio { segments: all.clone(), tail: writer.buffered_audio().to_vec(), format }));
                     }
+                    RecorderMsg::Finish => break,
                 }
             }
             if let Ok(Some(last)) = writer.finish() {
@@ -284,11 +312,11 @@ impl RecorderThread {
     }
 
     fn push(&self, samples: Vec<f32>) {
-        let _ = self.tx.send(Some(samples));
+        let _ = self.tx.send(RecorderMsg::Audio(samples));
     }
 
     fn finish(mut self) -> Vec<SegmentInfo> {
-        let _ = self.tx.send(None);
+        let _ = self.tx.send(RecorderMsg::Finish);
         self.join.take().and_then(|j| j.join().ok()).unwrap_or_default()
     }
 }
@@ -360,6 +388,13 @@ impl SessionTask {
                     Some(SessionMsg::Audio(samples)) => self.on_audio(samples),
                     Some(SessionMsg::Mode(m)) => self.set_mode(m),
                     Some(SessionMsg::Pause(paused)) => self.set_paused(paused),
+                    Some(SessionMsg::Preview(reply)) => {
+                        if !self.paused {
+                            let _ = reply.send(Err(anyhow::anyhow!("Pause this recording to review its audio")));
+                        } else if let Some(recorder) = &self.recorder {
+                            let _ = recorder.tx.send(RecorderMsg::Preview(reply));
+                        }
+                    }
                     Some(SessionMsg::Gap { start_ms, end_ms, cause }) => {
                         let _ = self.engine.store.add_gap(&self.id, start_ms, end_ms, &cause);
                         self.engine.emit(EngineEvent::Gap { session_id: self.id.clone(), start_ms, end_ms, cause });
