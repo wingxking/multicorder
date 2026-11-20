@@ -374,6 +374,11 @@ impl Engine {
         self.handle(id)?.ingest(seq, wall_ms, pcm)
     }
 
+    /// Next tab frame seq a session expects; a reconnecting extension resends from here.
+    pub fn tab_next_seq(&self, id: &str) -> anyhow::Result<u32> {
+        Ok(self.handle(id)?.next_seq())
+    }
+
     pub fn media_mark(&self, id: &str, wall_ms: f64, media_ms: Option<i64>, paused: bool, rate: f64, live: bool, video_key: Option<String>) -> anyhow::Result<()> {
         let h = self.handle(id)?;
         if h.waiting_for_audio() || h.paused() || h.capture_closed() {
@@ -522,16 +527,18 @@ impl Engine {
         if self.is_active(id) {
             anyhow::bail!("stop the session before deleting it");
         }
+        if !mc_core::is_valid_id(id) || self.store.session(id)?.is_none() {
+            anyhow::bail!("no session {id}");
+        }
         self.remove_session_data(id)
     }
 
-    /// Deletes a session's rows and its audio folder.
+    /// Deletes a session's rows and its audio folder. Refuses ids that are not plain ids, since the
+    /// folder path is built from the id (`audio/../..` would otherwise escape the data folder).
     pub(crate) fn remove_session_data(&self, id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(mc_core::is_valid_id(id), "invalid session id");
         self.store.delete_session(id)?;
-        let dir = self.session_dir(id);
-        if dir.starts_with(self.data_dir.join("audio")) {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        let _ = std::fs::remove_dir_all(self.session_dir(id));
         Ok(())
     }
 

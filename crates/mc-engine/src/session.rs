@@ -208,6 +208,12 @@ impl SessionHandle {
         }
     }
 
+    /// Next tab frame seq the session expects (0 before the first frame). Reconnecting clients
+    /// resend from here.
+    pub fn next_seq(&self) -> u32 {
+        if self.seq_started.load(Ordering::Acquire) { self.next_seq.load(Ordering::Acquire) } else { 0 }
+    }
+
     /// Accepts one tab frame; fills seq gaps with silence (recorded as a gap) and drops duplicates.
     pub fn ingest(&self, seq: u32, wall_ms: f64, pcm: &[i16]) -> anyhow::Result<u32> {
         anyhow::ensure!(!self.capture_closed(), "Recording has ended");

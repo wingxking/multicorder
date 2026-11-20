@@ -15,6 +15,8 @@ use serde_json::json;
 use crate::ApiState;
 
 pub const HEADER_LEN: usize = 20;
+/// Frames accepted per second before the reader slows down (live rate is 10/s).
+const MAX_FRAMES_PER_SEC: u32 = 400;
 
 #[derive(Debug, PartialEq)]
 pub struct Frame<'a> {
@@ -126,16 +128,20 @@ async fn run(state: ApiState, id: String, mut socket: WebSocket) {
         };
         match msg {
             Message::Binary(bytes) => {
+                let Some(f) = parse_frame(&bytes) else { continue };
+                // Live is 10 frames/s; a resend after a reconnect bursts up to 600 (60 s buffer).
+                // Over the cap the reader waits instead of dropping, so TCP backpressure slows the
+                // client and no buffered audio is lost.
                 if sec_start.elapsed() >= Duration::from_secs(1) {
                     sec_start = Instant::now();
                     frames_this_sec = 0;
                 }
                 frames_this_sec += 1;
-                // Live is 10 frames/s; resend after a reconnect may burst, cap generously.
-                if frames_this_sec > 400 {
-                    continue;
+                if frames_this_sec > MAX_FRAMES_PER_SEC {
+                    tokio::time::sleep(Duration::from_secs(1).saturating_sub(sec_start.elapsed())).await;
+                    sec_start = Instant::now();
+                    frames_this_sec = 1;
                 }
-                let Some(f) = parse_frame(&bytes) else { continue };
                 match engine.ingest_tab_frame(&id, f.seq, f.t_ms, &f.pcm) {
                     Ok(s) => upto = Some(s),
                     Err(_) => {
@@ -146,7 +152,9 @@ async fn run(state: ApiState, id: String, mut socket: WebSocket) {
             }
             Message::Text(text) => match serde_json::from_str::<Control>(&text) {
                 Ok(Control::Hello { .. }) => {
-                    let next = upto.map(|u| u + 1).unwrap_or(0);
+                    // The session's own position, not this connection's: after a reconnect the
+                    // client resends only what the session has not received.
+                    let next = engine.tab_next_seq(&id).unwrap_or_else(|_| upto.map(|u| u + 1).unwrap_or(0));
                     let _ = socket.send(Message::Text(json!({"t": "hello", "next_seq": next, "protocol": crate::PROTOCOL}).to_string().into())).await;
                 }
                 Ok(Control::MediaMark { wall_ms, media_ms, paused, rate, live, video_key }) => {

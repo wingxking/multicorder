@@ -234,3 +234,52 @@ async fn tab_inventory_keeps_parallel_sources_separate_and_routes_focus() {
     api.task.abort();
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test]
+async fn reconnecting_tab_resumes_from_the_session_position() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    let (api, dir) = start().await;
+    let created: Value = reqwest::Client::new()
+        .post(format!("http://{}/v1/sessions", api.addr)).bearer_auth("secret-token")
+        .json(&json!({"source": {"kind": "chromium_tab"}, "summary_mode": "off"}))
+        .send().await.unwrap().json().await.unwrap();
+    let endpoint = format!("ws://{}{}", api.addr, created["ingest_path"].as_str().unwrap());
+    let connect = || async {
+        let mut request = endpoint.clone().into_client_request().unwrap();
+        request.headers_mut().insert("Sec-WebSocket-Protocol", "mc.v1, secret-token".parse().unwrap());
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    };
+    let mut first = connect().await;
+    assert_eq!(ws_hello(&mut first).await, 0);
+    for seq in 0..5u32 {
+        first.send(Message::Binary(crate::ws::encode_frame(seq, 0.0, &[1000; 1600]).into())).await.unwrap();
+    }
+    // Each frame is handled before the next message, so a hello after them sees all five.
+    assert_eq!(ws_hello(&mut first).await, 5);
+    first.close(None).await.unwrap();
+
+    // A new connection must not report 0, or the client would resend its whole buffer.
+    let mut second = connect().await;
+    assert_eq!(ws_hello(&mut second).await, 5);
+    second.close(None).await.unwrap();
+    api.task.abort();
+    std::fs::remove_dir_all(dir).ok();
+}
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Sends `hello` on an ingest socket and returns the server's `next_seq`.
+async fn ws_hello(socket: &mut Ws) -> u64 {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    socket.send(Message::Text(json!({"t": "hello"}).to_string().into())).await.unwrap();
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(3), socket.next()).await.unwrap().unwrap().unwrap();
+        let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        if v["t"] == "hello" {
+            return v["next_seq"].as_u64().unwrap();
+        }
+    }
+}

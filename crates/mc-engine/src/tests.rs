@@ -469,3 +469,17 @@ async fn platform_subtitles_replace_asr_where_they_play() {
     assert!(engine.transcript(&session.id).unwrap().iter().all(|e| !e.engine.starts_with("caption:")));
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_refuses_ids_that_leave_the_audio_folder() {
+    let (engine, dir) = engine();
+    let victim = dir.join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("keep.txt"), b"x").unwrap();
+    // audio/../victim passes a component-wise `starts_with(audio)` check but is outside it.
+    assert!(engine.delete_session("../victim").is_err());
+    assert!(engine.delete_session("").is_err());
+    assert!(engine.delete_session("01jxnotarealsession0000000").is_err());
+    assert!(victim.join("keep.txt").exists());
+    std::fs::remove_dir_all(dir).ok();
+}

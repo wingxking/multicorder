@@ -235,9 +235,15 @@ Return only JSON {{\"points\":[{{\"text\":\"...\",\"evidence\":[\"<segment id>\"
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str()).filter_map(|id| by_id.get(id)).map(|e| Evidence { event_id: e.id.clone(), start_ms: e.start_ms, end_ms: e.end_ms }).collect())
             .unwrap_or_default();
-        if !text.is_empty() && !ev.is_empty() {
-            pts.push(MissedPoint { text, evidence: ev });
+        if text.is_empty() || ev.is_empty() {
+            continue;
         }
+        // Same rule as key points and the report: every number must appear in the cited text.
+        let evidence_text = ev.iter().filter_map(|e| by_id.get(e.event_id.as_str())).map(|e| e.text.as_str()).collect::<Vec<_>>().join(" ");
+        if numbers::check(&text, &evidence_text).is_err() {
+            continue;
+        }
+        pts.push(MissedPoint { text, evidence: ev });
     }
     Ok((Missed { minutes, from_ms, to_ms, points: pts, source: "model" }, Some(usage)))
 }
@@ -366,6 +372,28 @@ mod tests {
         apply_ops(&store, &s, &json!({"ops":[{"op":"upsert","key":"a","type":"key_point","text":"Launch in March","evidence":["ev1"]}]}), &by_id, &[]).unwrap();
         let (m, _) = missed(&store, None, &s, 5, "en").await.unwrap();
         assert_eq!(m.points.len(), 1);
+    }
+
+    struct CannedLlm(Value);
+
+    #[async_trait::async_trait]
+    impl Llm for CannedLlm {
+        async fn chat_json(&self, _: &str, _: &str, _: u32) -> anyhow::Result<(Value, Usage)> {
+            Ok((self.0.clone(), Usage { provider: "fake".into(), model: "fake".into(), input_tokens: 0, output_tokens: 0, usd: 0.0 }))
+        }
+    }
+
+    #[tokio::test]
+    async fn missed_drops_model_points_with_numbers_not_in_evidence() {
+        let (store, s, _) = setup();
+        let llm: Arc<dyn Llm> = Arc::new(CannedLlm(json!({"points": [
+            {"text": "Falcon budget is 42 million", "evidence": ["ev0"]},
+            {"text": "Falcon budget is 43 million", "evidence": ["ev0"]},
+            {"text": "Uncited", "evidence": ["nope"]}
+        ]})));
+        let (m, _) = missed(&store, Some(&llm), &s, 15, "en").await.unwrap();
+        assert_eq!(m.source, "model");
+        assert_eq!(m.points.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["Falcon budget is 42 million"]);
     }
 
     #[test]

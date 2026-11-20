@@ -15,6 +15,12 @@ pub fn new_id() -> String {
     ulid::Ulid::new().to_string().to_lowercase()
 }
 
+/// Whether `id` looks like an id from [`new_id`] (letters and digits only), so it is safe to use as
+/// a file name: no separators, no `..`.
+pub fn is_valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
